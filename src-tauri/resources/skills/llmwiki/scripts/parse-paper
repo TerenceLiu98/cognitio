@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+input=${1:?PDF input path required}
+output=${2:?parse output directory required}
+mode=${3:-precision}
+binary=${LLMWIKI_BIN:-llmwiki}
+
+exec "$binary" parse --input "$input" --output "$output" --mode "$mode" --json
