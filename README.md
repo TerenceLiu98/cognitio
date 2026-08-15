@@ -1,6 +1,6 @@
 # LLMWiki
 
-LLMWiki is a local-first macOS utility that turns academic PDFs into a linked Quartz knowledge base. It watches a workspace inbox, delegates paper analysis to Codex, Claude Code, or OpenCode, and verifies that each result is committed and pushed before archiving the source PDF.
+LLMWiki is a local-first macOS menu bar utility that turns academic PDFs into a linked Quartz knowledge base. It watches a workspace inbox, delegates paper analysis to Codex, Claude Code, or OpenCode, and verifies that each result is committed and pushed before archiving the source PDF.
 
 The current release is an unsigned developer preview for macOS 13+ on Apple Silicon. Read `PRD.md` for product scope, `PLAN.md` for architecture and milestones, and `docs/DEVELOPER_PREVIEW.md` for compatibility and acceptance status.
 
@@ -38,6 +38,8 @@ pnpm tauri build --debug --bundles app
 ```
 
 The ad-hoc-signed local bundle is written to `src-tauri/target/debug/bundle/macos/LLMWiki.app`. It is intentionally not notarized. A production distribution requires an Apple Developer signing identity and notarization credentials.
+
+After setup, LLMWiki launches without a Dock icon or primary window. Use its menu bar icon to view processing status, pause or resume watching, open workspace folders, and reach Settings or Logs. Closing the settings window hides it without stopping the background worker; use Quit LLMWiki in the menu to stop the app.
 
 ## Runtime Flow
 

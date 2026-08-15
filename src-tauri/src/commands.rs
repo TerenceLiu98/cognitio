@@ -6,7 +6,7 @@ use tauri_plugin_dialog::DialogExt;
 use crate::{
     config, credentials, diagnostics, jobs, launch_at_login, logging,
     models::{AppSettings, AppSnapshot, PreflightItem, PreflightReport},
-    skill, tools, wiki, workspace,
+    skill, tools, tray, wiki, workspace,
 };
 
 pub struct AppState {
@@ -81,20 +81,30 @@ pub fn save_settings(
         .lock()
         .map_err(|_| "application state lock is poisoned".to_string())?
         .settings = settings;
-    snapshot(&state)
+    let current = snapshot(&state)?;
+    tray::refresh(&app, &current);
+    Ok(current)
 }
 
 #[tauri::command]
-pub fn save_mineru_token(token: String, state: State<'_, AppState>) -> Result<AppSnapshot, String> {
+pub fn save_mineru_token(
+    token: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AppSnapshot, String> {
     credentials::store_mineru_token(token.trim())?;
     let entry = logging::append(&state.config_dir, "info", "MinerU credential updated", None)?;
-    let mut current = state
-        .snapshot
-        .lock()
-        .map_err(|_| "application state lock is poisoned".to_string())?;
-    current.mineru_token_configured = !token.trim().is_empty();
-    current.logs.push(entry);
-    Ok(current.clone())
+    let value = {
+        let mut current = state
+            .snapshot
+            .lock()
+            .map_err(|_| "application state lock is poisoned".to_string())?;
+        current.mineru_token_configured = !token.trim().is_empty();
+        current.logs.push(entry);
+        current.clone()
+    };
+    tray::refresh(&app, &value);
+    Ok(value)
 }
 
 #[tauri::command]
@@ -145,14 +155,18 @@ pub fn initialize_workspace(
         std::env::current_exe().map_err(|error| format!("resolve executable: {error}"))?;
     launch_at_login::configure(&home, &executable, settings.launch_at_login)?;
     config::save(&state.config_dir, &settings)?;
-    let mut current = state
-        .snapshot
-        .lock()
-        .map_err(|_| "application state lock is poisoned".to_string())?;
-    current.settings = settings;
-    current.configured = true;
-    current.watching = true;
-    Ok(current.clone())
+    let value = {
+        let mut current = state
+            .snapshot
+            .lock()
+            .map_err(|_| "application state lock is poisoned".to_string())?;
+        current.settings = settings;
+        current.configured = true;
+        current.watching = true;
+        current.clone()
+    };
+    tray::refresh(&app, &value);
+    Ok(value)
 }
 
 #[tauri::command]
@@ -250,16 +264,24 @@ pub fn run_preflight(settings: AppSettings) -> PreflightReport {
 }
 
 #[tauri::command]
-pub fn set_watching(watching: bool, state: State<'_, AppState>) -> Result<AppSnapshot, String> {
-    let mut current = state
-        .snapshot
-        .lock()
-        .map_err(|_| "application state lock is poisoned".to_string())?;
-    if watching && !current.configured {
-        return Err("workspace is not configured".into());
-    }
-    current.watching = watching;
-    Ok(current.clone())
+pub fn set_watching(
+    watching: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AppSnapshot, String> {
+    let value = {
+        let mut current = state
+            .snapshot
+            .lock()
+            .map_err(|_| "application state lock is poisoned".to_string())?;
+        if watching && !current.configured {
+            return Err("workspace is not configured".into());
+        }
+        current.watching = watching;
+        current.clone()
+    };
+    tray::refresh(&app, &value);
+    Ok(value)
 }
 
 #[tauri::command]
@@ -321,7 +343,9 @@ fn update_job(
         current.jobs.insert(0, summary);
     }
     let value = current.clone();
+    drop(current);
     let _ = app.emit("app-snapshot", value.clone());
+    tray::refresh(app, &value);
     Ok(value)
 }
 

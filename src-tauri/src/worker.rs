@@ -18,6 +18,7 @@ use crate::{
     jobs::{self, JobRecord, JobState},
     logging,
     models::{AfterProcessing, AppSnapshot},
+    tray,
 };
 
 pub fn start(app: AppHandle) {
@@ -308,7 +309,9 @@ fn publish_record(app: &AppHandle, record: &JobRecord) {
         snapshot.jobs.insert(0, summary);
     }
     let current: AppSnapshot = snapshot.clone();
-    let _ = app.emit("app-snapshot", current);
+    drop(snapshot);
+    let _ = app.emit("app-snapshot", current.clone());
+    tray::refresh(app, &current);
 }
 
 fn append_log(app: &AppHandle, level: &str, message: &str, job_id: Option<&str>) {

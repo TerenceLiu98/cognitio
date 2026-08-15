@@ -7,7 +7,7 @@ use std::{
 
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::{commands::AppState, jobs, logging, models::AppSnapshot};
+use crate::{commands::AppState, jobs, logging, models::AppSnapshot, tray};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Fingerprint {
@@ -110,11 +110,15 @@ fn scan_once(app: &AppHandle, tracker: &mut StabilityTracker) {
                         if let Ok(entry) =
                             logging::append(&state.config_dir, "error", message, Some(&record.id))
                         {
-                            if let Ok(mut snapshot) = state.snapshot.lock() {
+                            let current = if let Ok(mut snapshot) = state.snapshot.lock() {
                                 snapshot.jobs.insert(0, (&record).into());
                                 snapshot.logs.push(entry);
-                                let current: AppSnapshot = snapshot.clone();
-                                let _ = app.emit("app-snapshot", current);
+                                Some(snapshot.clone())
+                            } else {
+                                None
+                            };
+                            if let Some(current) = current {
+                                publish_snapshot(app, current);
                             }
                         }
                     }
@@ -141,11 +145,15 @@ fn scan_once(app: &AppHandle, tracker: &mut StabilityTracker) {
                     &format!("Queued {}", record.filename),
                     Some(&record.id),
                 ) {
-                    if let Ok(mut snapshot) = state.snapshot.lock() {
+                    let current = if let Ok(mut snapshot) = state.snapshot.lock() {
                         snapshot.jobs.insert(0, (&record).into());
                         snapshot.logs.push(entry);
-                        let current: AppSnapshot = snapshot.clone();
-                        let _ = app.emit("app-snapshot", current);
+                        Some(snapshot.clone())
+                    } else {
+                        None
+                    };
+                    if let Some(current) = current {
+                        publish_snapshot(app, current);
                     }
                 }
             }
@@ -155,6 +163,11 @@ fn scan_once(app: &AppHandle, tracker: &mut StabilityTracker) {
         }
     }
     tracker.remove_missing();
+}
+
+fn publish_snapshot(app: &AppHandle, snapshot: AppSnapshot) {
+    let _ = app.emit("app-snapshot", snapshot.clone());
+    tray::refresh(app, &snapshot);
 }
 
 #[cfg(test)]

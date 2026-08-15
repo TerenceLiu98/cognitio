@@ -17,13 +17,14 @@ Unknown agent major versions fail closed so CLI changes cannot silently weaken p
 
 ## Acceptance Record
 
-Verified on 2026-08-14:
+Verified on 2026-08-15:
 
-- Svelte checks, formatting, 4 Vitest tests, and the static production build pass.
-- Rust formatting, strict Clippy, and 17 unit tests pass offline.
+- Svelte checks, formatting, 5 Vitest tests, and the static production build pass.
+- Rust formatting, strict Clippy, and 20 unit tests pass offline.
 - Diagnostics tests confirm bearer tokens and credential-bearing remote URLs are redacted.
 - The hidden parser CLI rejects a missing PDF with a nonzero exit and a direct error.
 - `LLMWiki.app` builds as arm64, has a valid property list, and passes strict ad-hoc code-signature verification.
+- The bundle declares `LSUIElement=true`; its launched process reports `background only=true` and has no Dock presence.
 
 Real GitHub publication was not run because the configured `gh` token is invalid. Precision parsing was not run because no MinerU token is available. Consequently, real-agent PDF quality, remote push, and hosted Quartz rendering remain manual release checks after credentials are restored.
 

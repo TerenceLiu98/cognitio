@@ -10,6 +10,7 @@
   import SetupView from "$lib/components/SetupView.svelte";
   import * as api from "$lib/api";
   import { translate } from "$lib/i18n";
+  import { isViewName } from "$lib/navigation";
   import {
     emptySnapshot,
     type AppSettings,
@@ -32,7 +33,7 @@
 
   onMount(() => {
     let disposed = false;
-    let unlisten: (() => void) | null = null;
+    let unlisteners: (() => void)[] = [];
     void (async () => {
       await perform(async () => {
         snapshot = await api.getAppSnapshot();
@@ -40,17 +41,22 @@
         if (!snapshot.configured) active = "setup";
       });
       if ("__TAURI_INTERNALS__" in window) {
-        const stop = await listen<AppSnapshot>("app-snapshot", (event) => {
-          snapshot = event.payload;
-        });
-        if (disposed) stop();
-        else unlisten = stop;
+        const stops = await Promise.all([
+          listen<AppSnapshot>("app-snapshot", (event) => {
+            snapshot = event.payload;
+          }),
+          listen<unknown>("navigate-view", (event) => {
+            if (isViewName(event.payload)) active = event.payload;
+          }),
+        ]);
+        if (disposed) stops.forEach((stop) => stop());
+        else unlisteners = stops;
       }
       loading = false;
     })();
     return () => {
       disposed = true;
-      unlisten?.();
+      unlisteners.forEach((stop) => stop());
     };
   });
 

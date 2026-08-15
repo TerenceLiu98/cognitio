@@ -56,6 +56,7 @@
 
 - M0-M6 的开发者预览代码路径已完成；本地前端、Rust、严格 lint 与诊断脱敏测试通过。
 - M7 的源码说明、兼容矩阵、验收记录和 arm64 ad-hoc 签名 `.app` 已完成，详见 `docs/DEVELOPER_PREVIEW.md`。
+- macOS 生命周期已修正为原生 menubar utility：配置后隐藏主窗口和 Dock 图标，关闭窗口不退出后台任务。
 - 真实 GitHub push、MinerU Precision 和三种 Agent 的凭据 smoke test 仍需有效外部凭据；它们是发布验收项，不伪装为离线自动测试结果。
 
 ## 测试与验收
