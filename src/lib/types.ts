@@ -13,6 +13,7 @@ export type JobState =
   | "preflight"
   | "running"
   | "verifying"
+  | "archiving"
   | "succeeded"
   | "blocked"
   | "failed"
@@ -61,7 +62,21 @@ export interface JobSummary {
   createdAt: string;
   updatedAt: string;
   error: string | null;
+  allowedActions: ("retry" | "reparse" | "cancel")[];
+  blockScope: "job" | "repository" | null;
+  mineruMode: MineruMode | null;
+  deployment: DeploymentSummary;
 }
+
+export interface DeploymentSummary {
+  status:
+    "notTracked" | "pending" | "running" | "succeeded" | "failed" | "unknown";
+  url: string | null;
+  error: string | null;
+  updatedAt: string | null;
+}
+
+export type RetryMode = "reuse_valid" | "force_reparse_current_mode";
 
 export interface LogEntry {
   id: string;

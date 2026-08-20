@@ -29,6 +29,7 @@
       <p>{t("privacyNotice")}</p>
     </div>
   </div>
+  <p class="settings-note">{t("appliesToNewJobs")}</p>
   <div class="settings-form">
     <label
       >{t("language")}<select bind:value={settings.locale}
@@ -93,8 +94,9 @@
     <label class="wide"
       >{t("gitRemote")}<input
         bind:value={settings.gitRemote}
+        readonly
         placeholder={t("gitRemoteHint")}
-      /></label
+      /><small>{t("repositoryLocked")}</small></label
     >
     <label class="wide"
       >{t("websiteUrl")}<input
@@ -124,6 +126,11 @@
     margin-top: 30px;
     padding-block: 24px;
     border-block: 1px solid var(--border);
+  }
+  .settings-note {
+    margin: 14px 0 0;
+    color: var(--muted);
+    font-size: 12px;
   }
   label {
     display: grid;

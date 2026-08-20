@@ -16,6 +16,7 @@
     type AppSettings,
     type AppSnapshot,
     type PreflightReport,
+    type RetryMode,
     type ViewName,
   } from "$lib/types";
 
@@ -111,11 +112,12 @@
   async function save(): Promise<void> {
     busy = true;
     await perform(async () => {
-      snapshot = await api.saveSettings($state.snapshot(draft));
-      if (mineruToken.length > 0) {
-        snapshot = await api.saveMineruToken(mineruToken);
-        mineruToken = "";
-      }
+      snapshot = await api.applySettings(
+        $state.snapshot(draft),
+        mineruToken.trim().length > 0 ? "set" : "unchanged",
+        mineruToken,
+      );
+      mineruToken = "";
       draft = { ...snapshot.settings };
     });
     busy = false;
@@ -124,7 +126,7 @@
   async function clearMineruToken(): Promise<void> {
     busy = true;
     await perform(async () => {
-      snapshot = await api.saveMineruToken("");
+      snapshot = await api.applySettings($state.snapshot(draft), "clear");
       mineruToken = "";
     });
     busy = false;
@@ -142,6 +144,12 @@
   ): Promise<void> {
     await perform(async () => {
       snapshot = await action(id);
+    });
+  }
+
+  async function retryJob(id: string, mode: RetryMode): Promise<void> {
+    await perform(async () => {
+      snapshot = await api.retryJob(id, mode);
     });
   }
 </script>
@@ -195,7 +203,7 @@
         {snapshot}
         {t}
         onOpen={(target) => perform(() => api.openTarget(target))}
-        onRetry={(id) => updateJob(api.retryJob, id)}
+        onRetry={retryJob}
         onCancel={(id) => updateJob(api.cancelJob, id)}
       />
     {:else if active === "setup"}
@@ -226,9 +234,9 @@
         entries={snapshot.logs}
         locale={draft.locale}
         {t}
-        onExport={() =>
+        onExport={(includeDetailedLogs) =>
           perform(async () => {
-            await api.exportDiagnostics();
+            await api.exportDiagnostics(includeDetailedLogs);
           })}
       />
     {/if}

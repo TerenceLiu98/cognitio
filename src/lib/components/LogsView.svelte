@@ -12,7 +12,7 @@
     entries: LogEntry[];
     locale: string;
     t: Translator;
-    onExport: () => void;
+    onExport: (includeDetailedLogs: boolean) => void;
   } = $props();
 </script>
 
@@ -22,9 +22,14 @@
       <h1 id="logs-heading">{t("allLogs")}</h1>
       <p><HardDrive size={14} />{t("localOnly")}</p>
     </div>
-    <button class="secondary" type="button" onclick={onExport}
-      ><Download size={16} />{t("exportDiagnostics")}</button
-    >
+    <div class="export-actions">
+      <button class="secondary" type="button" onclick={() => onExport(false)}
+        ><Download size={16} />{t("exportDiagnostics")}</button
+      >
+      <button class="secondary" type="button" onclick={() => onExport(true)}
+        ><Download size={16} />{t("exportDetailedDiagnostics")}</button
+      >
+    </div>
   </div>
   {#if entries.length === 0}
     <div class="empty-state">
@@ -58,6 +63,12 @@
     display: flex;
     align-items: center;
     gap: 6px;
+  }
+  .export-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
   }
   .empty-state {
     display: grid;

@@ -4,11 +4,12 @@
     ExternalLink,
     FileText,
     FolderOpen,
+    RefreshCw,
     RotateCcw,
   } from "@lucide/svelte";
 
   import type { Translator } from "$lib/i18n";
-  import type { AppSnapshot, JobState } from "$lib/types";
+  import type { AppSnapshot, JobState, RetryMode } from "$lib/types";
 
   let {
     snapshot,
@@ -20,17 +21,17 @@
     snapshot: AppSnapshot;
     t: Translator;
     onOpen: (target: "inbox" | "wiki" | "website") => void;
-    onRetry: (id: string) => void;
+    onRetry: (id: string, mode: RetryMode) => void;
     onCancel: (id: string) => void;
   } = $props();
 
-  const terminalStates: JobState[] = ["succeeded", "failed", "cancelled"];
   const activeStates: JobState[] = [
     "stabilizing",
     "queued",
     "preflight",
     "running",
     "verifying",
+    "archiving",
   ];
 
   function count(states: JobState[]): number {
@@ -44,6 +45,17 @@
       hour: "2-digit",
       minute: "2-digit",
     }).format(new Date(value));
+  }
+
+  function deploymentLabel(
+    status: AppSnapshot["jobs"][number]["deployment"]["status"],
+  ): string | null {
+    if (status === "pending" || status === "running")
+      return t("deploymentPending");
+    if (status === "succeeded") return t("deploymentReady");
+    if (status === "failed") return t("deploymentFailed");
+    if (status === "unknown") return t("deploymentUnknown");
+    return null;
   }
 </script>
 
@@ -80,7 +92,10 @@
       <span>{t("completed")}</span><strong>{count(["succeeded"])}</strong>
     </div>
     <div>
-      <span>{t("failed")}</span><strong>{count(["failed", "blocked"])}</strong>
+      <span>{t("blocked")}</span><strong>{count(["blocked"])}</strong>
+    </div>
+    <div>
+      <span>{t("failed")}</span><strong>{count(["failed"])}</strong>
     </div>
   </div>
 
@@ -104,33 +119,67 @@
       {#each snapshot.jobs as job (job.id)}
         <article class="job-row">
           <div class="filename">
-            <FileText size={16} /><span>{job.filename}</span>
+            <FileText size={16} />
+            <div>
+              <span>{job.filename}</span><small>{job.phase}</small
+              >{#if job.error}<details>
+                  <summary>{t("details")}</summary>
+                  <p>{job.error}</p>
+                </details>{/if}
+            </div>
           </div>
-          <span
-            class:failed={job.state === "failed" || job.state === "blocked"}
-            class:success={job.state === "succeeded"}
-            class="state">{job.state}</span
-          >
+          <div class="state-cell">
+            <span
+              class:failed={job.state === "failed"}
+              class:blocked={job.state === "blocked"}
+              class:success={job.state === "succeeded"}
+              class="state">{job.state}</span
+            >{#if deploymentLabel(job.deployment.status)}<a
+                class="deployment"
+                class:failed={job.deployment.status === "failed"}
+                href={job.deployment.url ?? undefined}
+                target="_blank"
+                rel="noreferrer"
+                title={job.deployment.error ?? undefined}
+                >{deploymentLabel(job.deployment.status)}</a
+              >{/if}
+          </div>
           <div class="progress">
             <span style={`width: ${job.progress}%`}></span>
           </div>
           <time datetime={job.updatedAt}>{dateLabel(job.updatedAt)}</time>
           <div class="row-actions">
-            {#if terminalStates.includes(job.state)}
+            {#if job.allowedActions.includes("retry")}
               <button
                 class="icon-button"
                 type="button"
                 title={t("retry")}
                 aria-label={t("retry")}
-                onclick={() => onRetry(job.id)}><RotateCcw size={16} /></button
+                onclick={() => onRetry(job.id, "reuse_valid")}
+                ><RotateCcw size={16} /></button
               >
-            {:else}
+            {/if}
+            {#if job.allowedActions.includes("reparse")}
+              <button
+                class="icon-button"
+                type="button"
+                title={t("reparse")}
+                aria-label={t("reparse")}
+                onclick={() => {
+                  if (globalThis.confirm(t("confirmReparse")))
+                    onRetry(job.id, "force_reparse_current_mode");
+                }}><RefreshCw size={16} /></button
+              >
+            {/if}
+            {#if job.allowedActions.includes("cancel")}
               <button
                 class="icon-button"
                 type="button"
                 title={t("cancel")}
                 aria-label={t("cancel")}
-                onclick={() => onCancel(job.id)}><CircleX size={16} /></button
+                onclick={() => {
+                  if (globalThis.confirm(t("confirmCancel"))) onCancel(job.id);
+                }}><CircleX size={16} /></button
               >
             {/if}
           </div>
@@ -143,7 +192,7 @@
 <style>
   .metrics {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     margin: 26px 0 34px;
     border-block: 1px solid var(--border);
   }
@@ -211,7 +260,7 @@
     display: grid;
     grid-template-columns:
       minmax(180px, 2fr) 110px minmax(100px, 1fr)
-      150px 42px;
+      150px 72px;
     align-items: center;
     gap: 12px;
   }
@@ -238,6 +287,34 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .filename > div {
+    display: grid;
+    min-width: 0;
+    gap: 3px;
+  }
+  .filename small,
+  .filename summary,
+  .filename p {
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .filename details,
+  .filename p {
+    margin: 0;
+  }
+  .filename summary {
+    width: fit-content;
+    cursor: pointer;
+  }
+  .filename p {
+    margin-top: 4px;
+    white-space: normal;
+  }
+  .state-cell {
+    display: grid;
+    justify-items: start;
+    gap: 5px;
+  }
   .state {
     width: fit-content;
     border-radius: 999px;
@@ -254,6 +331,18 @@
   .state.failed {
     color: #8a3838;
     background: #f4dede;
+  }
+  .state.blocked {
+    color: #744b13;
+    background: #f2e2c6;
+  }
+  .deployment {
+    color: var(--muted);
+    font-size: 10px;
+    text-decoration: none;
+  }
+  .deployment.failed {
+    color: #8a3838;
   }
   .progress {
     height: 5px;
@@ -273,6 +362,7 @@
   .row-actions {
     display: flex;
     justify-content: flex-end;
+    gap: 2px;
   }
   @media (max-width: 880px) {
     .job-header {

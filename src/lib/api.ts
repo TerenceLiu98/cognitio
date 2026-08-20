@@ -6,6 +6,7 @@ import {
   type AppSettings,
   type AppSnapshot,
   type PreflightReport,
+  type RetryMode,
 } from "./types";
 
 const browserSnapshot: AppSnapshot = {
@@ -71,6 +72,39 @@ const browserSnapshot: AppSnapshot = {
   },
 };
 
+if (import.meta.env.MODE === "e2e") {
+  browserSnapshot.configured = true;
+  browserSnapshot.watching = true;
+  browserSnapshot.settings = {
+    ...browserSnapshot.settings,
+    workspaceRoot: "/tmp/cognitio-e2e",
+    gitRemote: "owner/research-library",
+    siteUrl: "https://owner.github.io/research-library/",
+  };
+  browserSnapshot.jobs = [
+    {
+      id: "blocked-job",
+      filename: "paper.pdf",
+      state: "blocked",
+      phase: "Task commit exists but push failed",
+      progress: 85,
+      agent: "codex",
+      createdAt: "2026-08-20T00:00:00Z",
+      updatedAt: "2026-08-20T00:00:00Z",
+      error: "Retry to resume Git push",
+      allowedActions: ["retry", "reparse"],
+      blockScope: "job",
+      mineruMode: "precision",
+      deployment: {
+        status: "failed",
+        url: "https://github.com/owner/research-library/actions",
+        error: "GitHub Pages concluded with failure",
+        updatedAt: "2026-08-20T00:10:00Z",
+      },
+    },
+  ];
+}
+
 function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -92,20 +126,23 @@ export async function getAppSnapshot(): Promise<AppSnapshot> {
     : structuredClone(browserSnapshot);
 }
 
-export async function saveSettings(
+export async function applySettings(
   settings: AppSettings,
+  tokenAction: "unchanged" | "set" | "clear",
+  token = "",
 ): Promise<AppSnapshot> {
   const plain = plainSettings(settings);
-  if (isTauriRuntime())
-    return call<AppSnapshot>("save_settings", { settings: plain });
+  if (isTauriRuntime()) {
+    return call<AppSnapshot>("apply_settings", {
+      settings: plain,
+      tokenAction,
+      token,
+    });
+  }
   browserSnapshot.settings = plain;
-  return structuredClone(browserSnapshot);
-}
-
-export async function saveMineruToken(token: string): Promise<AppSnapshot> {
-  if (isTauriRuntime())
-    return call<AppSnapshot>("save_mineru_token", { token });
-  browserSnapshot.mineruTokenConfigured = token.trim().length > 0;
+  if (tokenAction !== "unchanged") {
+    browserSnapshot.mineruTokenConfigured = tokenAction === "set";
+  }
   return structuredClone(browserSnapshot);
 }
 
@@ -165,9 +202,12 @@ export async function setWatching(watching: boolean): Promise<AppSnapshot> {
   return structuredClone(browserSnapshot);
 }
 
-export async function retryJob(jobId: string): Promise<AppSnapshot> {
+export async function retryJob(
+  jobId: string,
+  retryMode: RetryMode,
+): Promise<AppSnapshot> {
   return isTauriRuntime()
-    ? call<AppSnapshot>("retry_job", { jobId })
+    ? call<AppSnapshot>("retry_job", { jobId, retryMode })
     : structuredClone(browserSnapshot);
 }
 
@@ -183,6 +223,10 @@ export async function openTarget(
   if (isTauriRuntime()) await call<void>("open_target", { target });
 }
 
-export async function exportDiagnostics(): Promise<string | null> {
-  return isTauriRuntime() ? call<string | null>("export_diagnostics") : null;
+export async function exportDiagnostics(
+  includeDetailedLogs = false,
+): Promise<string | null> {
+  return isTauriRuntime()
+    ? call<string | null>("export_diagnostics", { includeDetailedLogs })
+    : null;
 }
