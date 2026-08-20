@@ -1,1 +1,1 @@
-export const productName = "LLMWiki";
+export const productName = "Cognitio";

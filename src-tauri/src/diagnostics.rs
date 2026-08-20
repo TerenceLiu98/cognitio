@@ -82,6 +82,7 @@ mod tests {
             ..AppSettings::default()
         };
         let snapshot = AppSnapshot {
+            ready: true,
             configured: false,
             watching: false,
             mineru_token_configured: true,
@@ -89,6 +90,7 @@ mod tests {
             tools: Vec::new(),
             jobs: Vec::new(),
             logs: Vec::new(),
+            initialization: Default::default(),
         };
         let destination = root.join("diagnostics.zip");
         export(&destination, &snapshot, &config_dir).expect("diagnostics export");

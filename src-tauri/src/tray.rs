@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::Command};
+use std::path::PathBuf;
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -101,7 +101,7 @@ pub fn install(app: &tauri::App) -> tauri::Result<()> {
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
         .show_menu_on_left_click(true)
-        .tooltip("LLMWiki")
+        .tooltip("Cognitio")
         .icon_as_template(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "inbox" => open_workspace_path(app, "inbox"),
@@ -236,7 +236,11 @@ fn presentation(snapshot: &AppSnapshot) -> TrayPresentation {
             "Settings…"
         },
         logs: if zh { "查看日志" } else { "View Logs" },
-        quit: if zh { "退出 LLMWiki" } else { "Quit LLMWiki" },
+        quit: if zh {
+            "退出 Cognitio"
+        } else {
+            "Quit Cognitio"
+        },
         configured: snapshot.configured,
         repository_available: repository_url(&snapshot.settings.git_remote).is_some(),
     }
@@ -270,7 +274,13 @@ fn open_workspace_path(app: &tauri::AppHandle, directory: &str) {
                 .then(|| PathBuf::from(&snapshot.settings.workspace_root))
         });
     if let Some(root) = root {
-        let _ = Command::new("open").arg(root.join(directory)).spawn();
+        let target = root.join(directory);
+        tauri::async_runtime::spawn(async move {
+            let _ = tokio::process::Command::new("open")
+                .arg(target)
+                .status()
+                .await;
+        });
     }
 }
 
@@ -282,7 +292,9 @@ fn open_repository(app: &tauri::AppHandle) {
         .ok()
         .and_then(|snapshot| repository_url(&snapshot.settings.git_remote));
     if let Some(url) = url {
-        let _ = Command::new("open").arg(url).spawn();
+        tauri::async_runtime::spawn(async move {
+            let _ = tokio::process::Command::new("open").arg(url).status().await;
+        });
     }
 }
 
@@ -314,6 +326,7 @@ fn repository_url(remote: &str) -> Option<String> {
 impl AppSnapshot {
     fn empty_for_tray() -> Self {
         Self {
+            ready: false,
             configured: false,
             watching: false,
             mineru_token_configured: false,
@@ -321,6 +334,7 @@ impl AppSnapshot {
             tools: Vec::new(),
             jobs: Vec::new(),
             logs: Vec::new(),
+            initialization: Default::default(),
         }
     }
 }

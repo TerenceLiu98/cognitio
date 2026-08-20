@@ -20,7 +20,7 @@
   } from "$lib/types";
 
   let snapshot: AppSnapshot = $state(structuredClone(emptySnapshot));
-  let draft: AppSettings = $state(structuredClone(emptySnapshot.settings));
+  let draft: AppSettings = $state({ ...emptySnapshot.settings });
   let active: ViewName = $state("overview");
   let loading = $state(true);
   let busy = $state(false);
@@ -35,15 +35,15 @@
     let disposed = false;
     let unlisteners: (() => void)[] = [];
     void (async () => {
-      await perform(async () => {
-        snapshot = await api.getAppSnapshot();
-        draft = structuredClone(snapshot.settings);
-        if (!snapshot.configured) active = "setup";
-      });
       if ("__TAURI_INTERNALS__" in window) {
         const stops = await Promise.all([
           listen<AppSnapshot>("app-snapshot", (event) => {
+            const wasConfigured = snapshot.configured;
             snapshot = event.payload;
+            if (!snapshot.configured || !wasConfigured) {
+              draft = { ...snapshot.settings };
+            }
+            if (!wasConfigured && snapshot.configured) active = "overview";
           }),
           listen<unknown>("navigate-view", (event) => {
             if (isViewName(event.payload)) active = event.payload;
@@ -52,6 +52,11 @@
         if (disposed) stops.forEach((stop) => stop());
         else unlisteners = stops;
       }
+      await perform(async () => {
+        snapshot = await api.getAppSnapshot();
+        draft = { ...snapshot.settings };
+        if (!snapshot.configured) active = "setup";
+      });
       loading = false;
     })();
     return () => {
@@ -84,10 +89,15 @@
     busy = true;
     await perform(async () => {
       snapshot = await api.initializeWorkspace($state.snapshot(draft));
-      draft = structuredClone(snapshot.settings);
-      active = "overview";
+      draft = { ...snapshot.settings };
     });
     busy = false;
+  }
+
+  async function cancelInitialization(): Promise<void> {
+    await perform(async () => {
+      snapshot = await api.cancelInitialization();
+    });
   }
 
   async function preflight(): Promise<void> {
@@ -106,7 +116,7 @@
         snapshot = await api.saveMineruToken(mineruToken);
         mineruToken = "";
       }
-      draft = structuredClone(snapshot.settings);
+      draft = { ...snapshot.settings };
     });
     busy = false;
   }
@@ -194,10 +204,12 @@
         tools={snapshot.tools}
         {report}
         {busy}
+        initialization={snapshot.initialization}
         {t}
         onChoose={chooseWorkspace}
         onPreflight={preflight}
         onInitialize={initialize}
+        onCancel={cancelInitialization}
       />
     {:else if active === "settings"}
       <SettingsView

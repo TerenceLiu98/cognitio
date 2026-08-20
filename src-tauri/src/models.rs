@@ -14,14 +14,19 @@ pub struct AppSettings {
     pub repository_visibility: RepositoryVisibility,
     #[serde(default)]
     pub git_remote: String,
-    pub hosting_provider: HostingProvider,
+    #[serde(default = "default_site_title")]
+    pub site_title: String,
     pub site_url: String,
+}
+
+fn default_site_title() -> String {
+    "Research Library".into()
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 3,
             locale: Locale::En,
             workspace_root: String::new(),
             launch_at_login: false,
@@ -31,7 +36,7 @@ impl Default for AppSettings {
             mineru_mode: MineruMode::Precision,
             repository_visibility: RepositoryVisibility::Private,
             git_remote: String::new(),
-            hosting_provider: HostingProvider::Cloudflare,
+            site_title: default_site_title(),
             site_url: String::new(),
         }
     }
@@ -49,7 +54,32 @@ string_enum!(AfterProcessing { Keep => "keep", MoveToDone => "move_to_done", Tra
 string_enum!(AgentProvider { Auto => "auto", Codex => "codex", Claude => "claude", Opencode => "opencode" });
 string_enum!(MineruMode { Precision => "precision", Flash => "flash" });
 string_enum!(RepositoryVisibility { Private => "private", Public => "public" });
-string_enum!(HostingProvider { Cloudflare => "cloudflare", GithubPages => "github_pages" });
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializationSummary {
+    pub operation_id: Option<String>,
+    pub state: String,
+    pub phase: Option<String>,
+    pub progress: u8,
+    pub message: Option<String>,
+    pub error: Option<String>,
+    pub can_retry: bool,
+}
+
+impl Default for InitializationSummary {
+    fn default() -> Self {
+        Self {
+            operation_id: None,
+            state: "idle".into(),
+            phase: None,
+            progress: 0,
+            message: None,
+            error: None,
+            can_retry: false,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +118,7 @@ pub struct LogEntry {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSnapshot {
+    pub ready: bool,
     pub configured: bool,
     pub watching: bool,
     pub mineru_token_configured: bool,
@@ -95,6 +126,7 @@ pub struct AppSnapshot {
     pub tools: Vec<ToolCapability>,
     pub jobs: Vec<JobSummary>,
     pub logs: Vec<LogEntry>,
+    pub initialization: InitializationSummary,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -3,8 +3,9 @@ export type ViewName = "overview" | "setup" | "settings" | "logs";
 export type AgentProvider = "auto" | "codex" | "claude" | "opencode";
 export type MineruMode = "precision" | "flash";
 export type AfterProcessing = "keep" | "move_to_done" | "trash";
-export type HostingProvider = "cloudflare" | "github_pages";
 export type RepositoryVisibility = "private" | "public";
+export type InitializationState =
+  "idle" | "running" | "succeeded" | "failed" | "cancelled" | "interrupted";
 export type JobState =
   | "detected"
   | "stabilizing"
@@ -28,8 +29,18 @@ export interface AppSettings {
   mineruMode: MineruMode;
   repositoryVisibility: RepositoryVisibility;
   gitRemote: string;
-  hostingProvider: HostingProvider;
+  siteTitle: string;
   siteUrl: string;
+}
+
+export interface InitializationSummary {
+  operationId: string | null;
+  state: InitializationState;
+  phase: string | null;
+  progress: number;
+  message: string | null;
+  error: string | null;
+  canRetry: boolean;
 }
 
 export interface ToolCapability {
@@ -61,6 +72,7 @@ export interface LogEntry {
 }
 
 export interface AppSnapshot {
+  ready: boolean;
   configured: boolean;
   watching: boolean;
   mineruTokenConfigured: boolean;
@@ -68,6 +80,7 @@ export interface AppSnapshot {
   tools: ToolCapability[];
   jobs: JobSummary[];
   logs: LogEntry[];
+  initialization: InitializationSummary;
 }
 
 export interface PreflightItem {
@@ -83,7 +96,7 @@ export interface PreflightReport {
 }
 
 export const defaultSettings: AppSettings = {
-  schemaVersion: 1,
+  schemaVersion: 3,
   locale: "en",
   workspaceRoot: "",
   launchAtLogin: false,
@@ -93,11 +106,12 @@ export const defaultSettings: AppSettings = {
   mineruMode: "precision",
   repositoryVisibility: "private",
   gitRemote: "",
-  hostingProvider: "cloudflare",
+  siteTitle: "Research Library",
   siteUrl: "",
 };
 
 export const emptySnapshot: AppSnapshot = {
+  ready: false,
   configured: false,
   watching: false,
   mineruTokenConfigured: false,
@@ -105,4 +119,13 @@ export const emptySnapshot: AppSnapshot = {
   tools: [],
   jobs: [],
   logs: [],
+  initialization: {
+    operationId: null,
+    state: "idle",
+    phase: null,
+    progress: 0,
+    message: null,
+    error: null,
+    canRetry: false,
+  },
 };

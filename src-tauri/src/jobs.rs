@@ -107,6 +107,11 @@ impl JobRecord {
         self.state = next;
         self.phase = phase.into();
         self.progress = progress.min(100);
+        if next == JobState::Queued {
+            self.agent = None;
+            self.error = None;
+            self.base_commit = None;
+        }
         self.updated_at = Utc::now().to_rfc3339();
         Ok(())
     }
@@ -308,6 +313,23 @@ pub fn update(
     Ok(record)
 }
 
+pub fn update_phase(
+    workspace: &Path,
+    id: &str,
+    phase: &str,
+    progress: u8,
+) -> Result<JobRecord, String> {
+    let path = workspace.join("processing").join(id).join("job.json");
+    let json = fs::read_to_string(path).map_err(|error| format!("read job: {error}"))?;
+    let mut record: JobRecord =
+        serde_json::from_str(&json).map_err(|error| format!("parse job: {error}"))?;
+    record.phase = phase.into();
+    record.progress = progress.min(100);
+    record.updated_at = Utc::now().to_rfc3339();
+    save(workspace, &record)?;
+    Ok(record)
+}
+
 pub fn fail(workspace: &Path, id: &str, error: &str) -> Result<JobRecord, String> {
     let path = workspace.join("processing").join(id).join("job.json");
     let json = fs::read_to_string(path).map_err(|read_error| format!("read job: {read_error}"))?;
@@ -330,6 +352,34 @@ mod tests {
         assert!(!JobState::Queued.can_transition_to(JobState::Succeeded));
         assert!(JobState::Failed.can_transition_to(JobState::Queued));
         assert!(!JobState::Succeeded.can_transition_to(JobState::Queued));
+    }
+
+    #[test]
+    fn retry_clears_previous_execution_metadata() {
+        let mut record = JobRecord {
+            schema_version: 1,
+            id: "job".into(),
+            filename: "paper.pdf".into(),
+            source_path: "inbox/paper.pdf".into(),
+            input_path: "processing/job/paper.pdf".into(),
+            sha256: "hash".into(),
+            state: JobState::Blocked,
+            phase: "Agent did not create a commit".into(),
+            progress: 0,
+            agent: Some("codex".into()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            error: Some("stale error".into()),
+            base_commit: Some("abc123".into()),
+        };
+
+        record
+            .transition(JobState::Queued, "Waiting for processor", 10)
+            .expect("retry transition");
+
+        assert_eq!(record.agent, None);
+        assert_eq!(record.error, None);
+        assert_eq!(record.base_commit, None);
     }
 
     #[test]

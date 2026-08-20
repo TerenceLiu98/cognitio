@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod credentials;
 mod diagnostics;
+mod initialization;
 mod jobs;
 mod launch_at_login;
 mod logging;
@@ -17,9 +18,9 @@ mod worker;
 mod workspace;
 
 use commands::{
-    cancel_job, choose_workspace, export_diagnostics, get_app_snapshot, initialize_workspace,
-    open_target, retry_job, run_preflight, save_mineru_token, save_settings, set_watching,
-    AppState,
+    cancel_initialization, cancel_job, choose_workspace, export_diagnostics, get_app_snapshot,
+    initialize_workspace, open_target, retry_job, run_preflight, save_mineru_token, save_settings,
+    set_watching, AppState,
 };
 use tauri::Manager;
 
@@ -72,27 +73,34 @@ pub fn run_cli(args: &[String]) -> Result<bool, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        let view = app
+            .state::<AppState>()
+            .snapshot
+            .lock()
+            .map(|snapshot| {
+                if snapshot.configured {
+                    "overview"
+                } else {
+                    "setup"
+                }
+            })
+            .unwrap_or("setup");
+        tray::show_window(app, view);
+    }));
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let state = AppState::load(app.handle())?;
-            let configured = state
-                .snapshot
-                .lock()
-                .map(|snapshot| snapshot.configured)
-                .unwrap_or(false);
+            let state = AppState::new(app.handle())?;
             app.manage(state);
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             tray::install(app)?;
             watcher::start(app.handle().clone());
             worker::start(app.handle().clone());
-            if should_show_main_window(configured) {
-                if let Some(window) = app.get_webview_window("main") {
-                    window.show()?;
-                    window.set_focus()?;
-                }
-            }
+            commands::bootstrap(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -109,6 +117,7 @@ pub fn run() {
             save_mineru_token,
             choose_workspace,
             initialize_workspace,
+            cancel_initialization,
             run_preflight,
             set_watching,
             retry_job,
@@ -140,19 +149,4 @@ pub fn run() {
             tray::show_window(app, view);
         }
     });
-}
-
-fn should_show_main_window(configured: bool) -> bool {
-    !configured
-}
-
-#[cfg(test)]
-mod tests {
-    use super::should_show_main_window;
-
-    #[test]
-    fn only_unconfigured_launches_show_the_main_window() {
-        assert!(should_show_main_window(false));
-        assert!(!should_show_main_window(true));
-    }
 }

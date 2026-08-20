@@ -20,10 +20,10 @@ Unknown agent major versions fail closed so CLI changes cannot silently weaken p
 Verified on 2026-08-15:
 
 - Svelte checks, formatting, 5 Vitest tests, and the static production build pass.
-- Rust formatting, strict Clippy, and 20 unit tests pass offline.
+- Rust formatting, strict Clippy, and 24 Rust tests pass offline.
 - Diagnostics tests confirm bearer tokens and credential-bearing remote URLs are redacted.
 - The hidden parser CLI rejects a missing PDF with a nonzero exit and a direct error.
-- `LLMWiki.app` builds as arm64, has a valid property list, and passes strict ad-hoc code-signature verification.
+- `Cognitio.app` builds as arm64, has a valid property list, and passes strict ad-hoc code-signature verification.
 - The bundle declares `LSUIElement=true`; its launched process reports `background only=true` and has no Dock presence.
 
 Real GitHub publication was not run because the configured `gh` token is invalid. Precision parsing was not run because no MinerU token is available. Consequently, real-agent PDF quality, remote push, and hosted Quartz rendering remain manual release checks after credentials are restored.
@@ -39,5 +39,6 @@ Real GitHub publication was not run because the configured `gh` token is invalid
 ## Known Limitations
 
 - The preview is not Developer ID signed, notarized, auto-updated, or supported on Intel, Windows, or Linux.
-- Cloudflare Pages connection and GitHub authentication remain user-operated.
+- GitHub authentication and repository administration permissions remain user-operated; the app enables Pages workflow mode through the authenticated `gh` session.
+- Quartz is bundled at the pinned commit, so workspace initialization does not download the template or run Node locally.
 - There is no numeric coverage threshold or browser-level Playwright suite yet; current UI coverage is component-level.

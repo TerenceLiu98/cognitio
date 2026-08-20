@@ -4,6 +4,6 @@ import { productName } from "./product";
 
 describe("product metadata", () => {
   it("uses the public product name", () => {
-    expect(productName).toBe("LLMWiki");
+    expect(productName).toBe("Cognitio");
   });
 });

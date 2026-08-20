@@ -31,8 +31,15 @@ impl ParseMode {
 }
 
 pub async fn parse(input: &Path, output: &Path, mode: ParseMode) -> Result<PathBuf, String> {
-    validate_input(input, mode)?;
-    fs::create_dir_all(output).map_err(|error| format!("create parse output: {error}"))?;
+    let validate_input_path = input.to_path_buf();
+    let validate_output_path = output.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        validate_input(&validate_input_path, mode)?;
+        fs::create_dir_all(&validate_output_path)
+            .map_err(|error| format!("create parse output: {error}"))
+    })
+    .await
+    .map_err(|error| format!("join MinerU input validation: {error}"))??;
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -93,7 +100,8 @@ async fn parse_flash(client: &Client, input: &Path, output: &Path) -> Result<Pat
                 let url = field(&response, &["data", "markdown_url"])?;
                 let bytes = download(client, url).await?;
                 let destination = output.join("full.md");
-                fs::write(&destination, bytes)
+                tokio::fs::write(&destination, bytes)
+                    .await
                     .map_err(|error| format!("write Markdown: {error}"))?;
                 return Ok(destination);
             }
@@ -108,10 +116,14 @@ async fn parse_flash(client: &Client, input: &Path, output: &Path) -> Result<Pat
 }
 
 async fn parse_precision(client: &Client, input: &Path, output: &Path) -> Result<PathBuf, String> {
-    let token = std::env::var("MINERU_TOKEN")
+    let environment_token = std::env::var("MINERU_TOKEN")
         .ok()
-        .filter(|value| !value.is_empty())
-        .or(credentials::mineru_token()?)
+        .filter(|value| !value.is_empty());
+    let token = tokio::task::spawn_blocking(credentials::mineru_token)
+        .await
+        .map_err(|error| format!("join Keychain read: {error}"))??;
+    let token = environment_token
+        .or(token)
         .ok_or_else(|| "Precision mode requires a MinerU token in Keychain".to_string())?;
     let filename = filename(input)?;
     let response = api_json(client.post(format!("{API_ROOT}/v4/file-urls/batch")).bearer_auth(&token).json(&json!({
@@ -140,7 +152,10 @@ async fn parse_precision(client: &Client, input: &Path, output: &Path) -> Result
             "done" => {
                 let url = field(result, &["full_zip_url"])?;
                 let bytes = download(client, url).await?;
-                return extract_zip(&bytes, output);
+                let destination = output.to_path_buf();
+                return tokio::task::spawn_blocking(move || extract_zip(&bytes, &destination))
+                    .await
+                    .map_err(|error| format!("join MinerU archive extraction: {error}"))?;
             }
             "failed" => {
                 return Err(optional_field(result, &["err_msg"])
@@ -172,7 +187,9 @@ async fn api_json(builder: reqwest::RequestBuilder) -> Result<Value, String> {
 }
 
 async fn upload(client: &Client, url: &str, input: &Path) -> Result<(), String> {
-    let bytes = fs::read(input).map_err(|error| format!("read PDF for upload: {error}"))?;
+    let bytes = tokio::fs::read(input)
+        .await
+        .map_err(|error| format!("read PDF for upload: {error}"))?;
     client
         .put(url)
         .body(bytes)

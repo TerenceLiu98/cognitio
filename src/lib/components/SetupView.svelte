@@ -1,9 +1,16 @@
 <script lang="ts">
-  import { Check, CircleAlert, FolderSearch, RefreshCw } from "@lucide/svelte";
+  import {
+    Check,
+    CircleAlert,
+    FolderSearch,
+    RefreshCw,
+    X,
+  } from "@lucide/svelte";
 
   import type { Translator } from "$lib/i18n";
   import type {
     AppSettings,
+    InitializationSummary,
     PreflightReport,
     ToolCapability,
   } from "$lib/types";
@@ -13,19 +20,23 @@
     tools,
     report,
     busy,
+    initialization,
     t,
     onChoose,
     onPreflight,
     onInitialize,
+    onCancel,
   }: {
     settings: AppSettings;
     tools: ToolCapability[];
     report: PreflightReport | null;
     busy: boolean;
+    initialization: InitializationSummary;
     t: Translator;
     onChoose: () => void;
     onPreflight: () => void;
     onInitialize: () => void;
+    onCancel: () => void;
   } = $props();
 </script>
 
@@ -44,7 +55,7 @@
         aria-label={t("workspaceRoot")}
         readonly
         value={settings.workspaceRoot}
-        placeholder="/Users/name/LLMWiki"
+        placeholder="/Users/name/Cognitio"
       />
       <button class="secondary" type="button" onclick={onChoose}
         ><FolderSearch size={16} />{t("choose")}</button
@@ -53,6 +64,14 @@
   </div>
 
   <div class="form-grid">
+    <label
+      >{t("siteTitle")}
+      <input
+        bind:value={settings.siteTitle}
+        maxlength="80"
+        placeholder="Research Library"
+      />
+    </label>
     <label
       >{t("agent")}
       <select bind:value={settings.agentProvider}>
@@ -73,6 +92,7 @@
           value="flash">{t("flash")}</option
         ></select
       >
+      <small>{t("mineruUploadNotice")}</small>
     </label>
     <label
       >{t("repository")}
@@ -88,14 +108,10 @@
         placeholder={t("gitRemoteHint")}
       />
     </label>
-    <label
-      >{t("hosting")}
-      <select bind:value={settings.hostingProvider}
-        ><option value="cloudflare">{t("cloudflare")}</option><option
-          value="github_pages">{t("githubPages")}</option
-        ></select
-      >
-    </label>
+    <div class="readonly-setting">
+      <span>{t("publishing")}</span>
+      <strong>{t("githubActionsPages")}</strong>
+    </div>
   </div>
 
   <div class="form-section">
@@ -141,17 +157,38 @@
     </div>
   {/if}
 
+  {#if initialization.state !== "idle"}
+    <div class="initialization" role="status" aria-live="polite">
+      <div class="initialization-heading">
+        <strong>{initialization.message ?? t("initializing")}</strong>
+        <span>{initialization.progress}%</span>
+      </div>
+      <progress max="100" value={initialization.progress}></progress>
+      {#if initialization.error}<p class="initialization-error">
+          {initialization.error}
+        </p>{/if}
+    </div>
+  {/if}
+
   <div class="footer-actions">
+    {#if initialization.state === "running"}
+      <button class="secondary" type="button" onclick={onCancel}
+        ><X size={16} />{t("cancel")}</button
+      >
+    {/if}
     <button
       class="primary"
       type="button"
-      disabled={busy || !settings.workspaceRoot}
+      disabled={busy ||
+        initialization.state === "running" ||
+        !settings.workspaceRoot ||
+        !settings.siteTitle.trim()}
       onclick={onInitialize}
     >
       {#if busy}<RefreshCw size={16} class="spin" />{:else}<Check
           size={16}
         />{/if}
-      {busy ? t("initializing") : t("initialize")}
+      {initialization.canRetry ? t("retry") : t("initialize")}
     </button>
   </div>
 </section>
@@ -183,6 +220,21 @@
     gap: 7px;
     color: var(--muted);
     font-size: 12px;
+  }
+  .readonly-setting {
+    display: grid;
+    gap: 7px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .readonly-setting strong {
+    min-height: 38px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 11px;
+    color: var(--text);
+    background: var(--surface);
+    font-weight: 500;
   }
   .tool-grid {
     display: grid;
@@ -239,7 +291,31 @@
   .footer-actions {
     display: flex;
     justify-content: flex-end;
+    gap: 8px;
     margin-top: 28px;
+  }
+  .initialization {
+    margin-top: 18px;
+    border-left: 3px solid var(--accent);
+    padding: 12px 14px;
+    background: var(--surface);
+  }
+  .initialization-heading {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    font-size: 12px;
+  }
+  progress {
+    width: 100%;
+    height: 7px;
+    margin-top: 10px;
+    accent-color: var(--accent);
+  }
+  .initialization-error {
+    margin: 8px 0 0;
+    color: #8a3838;
+    font-size: 12px;
   }
   :global(.spin) {
     animation: spin 1s linear infinite;

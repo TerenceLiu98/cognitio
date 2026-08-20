@@ -9,6 +9,7 @@ import {
 } from "./types";
 
 const browserSnapshot: AppSnapshot = {
+  ready: true,
   configured: false,
   watching: false,
   mineruTokenConfigured: false,
@@ -59,10 +60,23 @@ const browserSnapshot: AppSnapshot = {
   ],
   jobs: [],
   logs: [],
+  initialization: {
+    operationId: null,
+    state: "idle",
+    phase: null,
+    progress: 0,
+    message: null,
+    error: null,
+    canRetry: false,
+  },
 };
 
 function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function plainSettings(settings: AppSettings): AppSettings {
+  return JSON.parse(JSON.stringify(settings)) as AppSettings;
 }
 
 async function call<T>(
@@ -81,8 +95,10 @@ export async function getAppSnapshot(): Promise<AppSnapshot> {
 export async function saveSettings(
   settings: AppSettings,
 ): Promise<AppSnapshot> {
-  if (isTauriRuntime()) return call<AppSnapshot>("save_settings", { settings });
-  browserSnapshot.settings = structuredClone(settings);
+  const plain = plainSettings(settings);
+  if (isTauriRuntime())
+    return call<AppSnapshot>("save_settings", { settings: plain });
+  browserSnapshot.settings = plain;
   return structuredClone(browserSnapshot);
 }
 
@@ -100,25 +116,42 @@ export async function chooseWorkspace(): Promise<string | null> {
 export async function initializeWorkspace(
   settings: AppSettings,
 ): Promise<AppSnapshot> {
+  const plain = plainSettings(settings);
   if (isTauriRuntime())
-    return call<AppSnapshot>("initialize_workspace", { settings });
-  browserSnapshot.settings = structuredClone(settings);
-  browserSnapshot.configured = Boolean(settings.workspaceRoot);
-  browserSnapshot.watching = browserSnapshot.configured;
+    return call<AppSnapshot>("initialize_workspace", { settings: plain });
+  browserSnapshot.settings = plain;
+  browserSnapshot.initialization = {
+    operationId: crypto.randomUUID(),
+    state: "running",
+    phase: "template",
+    progress: 30,
+    message: "Installing bundled Quartz template",
+    error: null,
+    canRetry: false,
+  };
+  return structuredClone(browserSnapshot);
+}
+
+export async function cancelInitialization(): Promise<AppSnapshot> {
+  if (isTauriRuntime()) return call<AppSnapshot>("cancel_initialization");
+  browserSnapshot.initialization.state = "cancelled";
+  browserSnapshot.initialization.message = "Initialization cancelled";
+  browserSnapshot.initialization.canRetry = true;
   return structuredClone(browserSnapshot);
 }
 
 export async function runPreflight(
   settings: AppSettings,
 ): Promise<PreflightReport> {
+  const plain = plainSettings(settings);
   if (isTauriRuntime())
-    return call<PreflightReport>("run_preflight", { settings });
+    return call<PreflightReport>("run_preflight", { settings: plain });
   return {
-    ready: Boolean(settings.workspaceRoot),
+    ready: Boolean(plain.workspaceRoot),
     items: [
       {
         id: "workspace",
-        ok: Boolean(settings.workspaceRoot),
+        ok: Boolean(plain.workspaceRoot),
         message: "Workspace",
         detail: null,
       },

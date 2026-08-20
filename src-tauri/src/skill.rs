@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const VERSION: &str = "1";
+const VERSION: &str = "4";
 const FILES: [(&str, &str); 4] = [
     (
         "SKILL.md",
@@ -26,8 +26,6 @@ const FILES: [(&str, &str); 4] = [
         include_str!("../resources/skills/llmwiki/references/writing-guide.md"),
     ),
 ];
-const SCRIPT: &str = include_str!("../resources/skills/llmwiki/scripts/parse-paper");
-
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Manifest {
@@ -45,8 +43,19 @@ pub fn install_all(home: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn install(root: &Path) -> Result<PathBuf, String> {
-    verify_existing(root)?;
-    for (relative, contents) in FILES.into_iter().chain([("scripts/parse-paper", SCRIPT)]) {
+    let installed = verify_existing(root)?;
+    let manifest = expected_manifest();
+    if let Some(installed) = installed {
+        for relative in installed
+            .files
+            .keys()
+            .filter(|relative| !manifest.files.contains_key(*relative))
+        {
+            fs::remove_file(root.join(relative))
+                .map_err(|error| format!("remove obsolete managed Skill file: {error}"))?;
+        }
+    }
+    for (relative, contents) in FILES {
         let path = root.join(relative);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -54,25 +63,15 @@ fn install(root: &Path) -> Result<PathBuf, String> {
         }
         write_atomic(&path, contents.as_bytes())?;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(
-            root.join("scripts/parse-paper"),
-            fs::Permissions::from_mode(0o755),
-        )
-        .map_err(|error| format!("make parse-paper executable: {error}"))?;
-    }
-    let manifest = expected_manifest();
     let bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| format!("serialize Skill manifest: {error}"))?;
     write_atomic(&root.join(".llmwiki-install.json"), &bytes)?;
     Ok(root.to_path_buf())
 }
 
-fn verify_existing(root: &Path) -> Result<(), String> {
+fn verify_existing(root: &Path) -> Result<Option<Manifest>, String> {
     if !root.exists() {
-        return Ok(());
+        return Ok(None);
     }
     let path = root.join(".llmwiki-install.json");
     let json = fs::read_to_string(&path).map_err(|_| {
@@ -83,22 +82,21 @@ fn verify_existing(root: &Path) -> Result<(), String> {
     })?;
     let installed: Manifest = serde_json::from_str(&json)
         .map_err(|_| format!("refusing to overwrite modified Skill at {}", root.display()))?;
-    for (relative, expected) in installed.files {
-        let bytes = fs::read(root.join(&relative))
+    for (relative, expected) in &installed.files {
+        let bytes = fs::read(root.join(relative))
             .map_err(|_| format!("installed Skill file is missing: {relative}"))?;
-        if checksum(&bytes) != expected {
+        if checksum(&bytes) != *expected {
             return Err(format!(
                 "refusing to overwrite user-modified Skill file: {relative}"
             ));
         }
     }
-    Ok(())
+    Ok(Some(installed))
 }
 
 fn expected_manifest() -> Manifest {
     let files = FILES
         .into_iter()
-        .chain([("scripts/parse-paper", SCRIPT)])
         .map(|(path, contents)| (path.into(), checksum(contents.as_bytes())))
         .collect();
     Manifest {
@@ -137,6 +135,47 @@ mod tests {
             fs::read_to_string(root.join("SKILL.md")).expect("read"),
             "user edit"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn paper_ingest_does_not_build_quartz_locally() {
+        let skill = FILES
+            .iter()
+            .find_map(|(path, contents)| (*path == "SKILL.md").then_some(*contents))
+            .expect("Skill resource");
+        assert!(!skill.contains("npx quartz"));
+        assert!(skill.contains("Do not invoke MinerU"));
+        assert!(skill.contains("$LLMWIKI_PARSED_MARKDOWN"));
+        assert!(skill.contains("GitHub Actions owns dependency installation and site builds"));
+    }
+
+    #[test]
+    fn removes_obsolete_managed_files() {
+        let root = std::env::temp_dir().join(format!(
+            "cognitio-obsolete-skill-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("scripts")).expect("skill directory");
+        let obsolete = b"managed parser";
+        fs::write(root.join("scripts/parse-paper"), obsolete).expect("obsolete file");
+        let manifest = Manifest {
+            version: "3".into(),
+            files: [("scripts/parse-paper".into(), checksum(obsolete))]
+                .into_iter()
+                .collect(),
+        };
+        fs::write(
+            root.join(".llmwiki-install.json"),
+            serde_json::to_vec_pretty(&manifest).expect("manifest"),
+        )
+        .expect("installed manifest");
+
+        install(&root).expect("upgrade Skill");
+
+        assert!(!root.join("scripts/parse-paper").exists());
+        assert!(root.join("SKILL.md").is_file());
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

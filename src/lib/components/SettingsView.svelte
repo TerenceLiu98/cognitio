@@ -56,7 +56,7 @@
         ><option value="precision">{t("precision")}</option><option
           value="flash">{t("flash")}</option
         ></select
-      ></label
+      ><small>{t("mineruUploadNotice")}</small></label
     >
     <label
       >{t("mineruToken")}<input
@@ -83,12 +83,12 @@
         ><option value="trash">{t("trash")}</option></select
       ></label
     >
-    <label
-      >{t("hosting")}<select bind:value={settings.hostingProvider}
-        ><option value="cloudflare">{t("cloudflare")}</option><option
-          value="github_pages">{t("githubPages")}</option
-        ></select
-      ></label
+    <label class="wide"
+      >{t("siteTitle")}<input
+        bind:value={settings.siteTitle}
+        maxlength="80"
+        placeholder="Research Library"
+      /><small>{t("siteTitleHint")}</small></label
     >
     <label class="wide"
       >{t("gitRemote")}<input

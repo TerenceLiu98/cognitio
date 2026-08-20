@@ -60,7 +60,13 @@ pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut tracker = StabilityTracker::default();
         loop {
-            scan_once(&app, &mut tracker);
+            let scan_app = app.clone();
+            tracker = tokio::task::spawn_blocking(move || {
+                scan_once(&scan_app, &mut tracker);
+                tracker
+            })
+            .await
+            .unwrap_or_default();
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     });

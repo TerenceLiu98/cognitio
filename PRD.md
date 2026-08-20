@@ -1,7 +1,7 @@
-# LLMWiki — Product Requirements Document
+# Cognitio — Product Requirements Document
 
 **Version:** v0.1 Draft
-**Date:** 2026-08-14
+**Date:** 2026-08-15
 **Status:** Product / Architecture Baseline
 **Product Type:** Local-first menubar utility for academic knowledge compilation
 
@@ -9,28 +9,28 @@
 
 ## 1. Product Summary
 
-LLMWiki is a lightweight local menubar utility that continuously converts academic papers into a linked, searchable Markdown knowledge base.
+Cognitio is a lightweight local menubar utility that continuously converts academic papers into a linked, searchable Markdown knowledge base.
 
-The user drops a PDF into a watched folder. LLMWiki detects the file and invokes the user's existing coding agent (Codex, Claude Code, or OpenCode) through its official non-interactive CLI interface. The agent activates the LLMWiki skill, uses MinerU to convert the PDF to Markdown, reads and analyzes the paper, searches the existing local knowledge base, creates or updates linked Markdown pages, commits the changes to Git, and pushes them to GitHub.
+The user drops a PDF into a watched folder. Cognitio detects the file and uses MinerU to convert it to local Markdown before invoking the user's existing coding agent (Codex, Claude Code, or OpenCode) through its official non-interactive CLI interface. The agent activates the Cognitio skill, reads and analyzes the prepared Markdown, searches the existing local knowledge base, creates or updates linked Markdown pages, commits the changes to Git, and pushes them to GitHub.
 
-The GitHub repository is the canonical knowledge store. Quartz 5 renders the repository into an interconnected academic knowledge website with wikilinks, backlinks, search, graph navigation, LaTeX, citations, and previews. Cloudflare Pages hosts the website.
+The GitHub repository is the canonical knowledge store. Quartz 5 renders the repository into an interconnected academic knowledge website with wikilinks, backlinks, search, graph navigation, LaTeX, citations, and previews. GitHub Actions builds and deploys the site to GitHub Pages from the same repository.
 
 The core product principle is:
 
-> **LLMWiki should be a thin automation layer around tools users already have, not a new AI platform with its own infrastructure.**
+> **Cognitio should be a thin automation layer around tools users already have, not a new AI platform with its own infrastructure.**
 
 The architectural model is:
 
 ```text
 Menubar = orchestration
 Agent CLI = reasoning runtime
-LLMWiki Skill = application logic
+Cognitio Skill = application logic
 MinerU = PDF parser
 Markdown = knowledge format
 Git = database + version control
 GitHub = remote sync
 Quartz = knowledge UI
-Cloudflare Pages = hosting
+GitHub Actions + Pages = build and hosting
 ```
 
 ---
@@ -55,7 +55,7 @@ At the same time, academic researchers already have:
 - Markdown workflows;
 - static-site hosting.
 
-LLMWiki should connect those existing tools into one automatic workflow.
+Cognitio should connect those existing tools into one automatic workflow.
 
 ---
 
@@ -98,7 +98,7 @@ Over time:
 → personal academic knowledge network
 ```
 
-LLMWiki should remain local-first: the PDF and LLM reasoning process do not need to run on an LLMWiki-operated cloud service.
+Cognitio should remain local-first: the PDF and LLM reasoning process do not need to run on an Cognitio-operated cloud service.
 
 ---
 
@@ -106,20 +106,20 @@ LLMWiki should remain local-first: the PDF and LLM reasoning process do not need
 
 ### 4.1 Primary Goals
 
-LLMWiki v0.1 must:
+Cognitio v0.1 must:
 
 1. Watch one or more user-selected folders for new PDFs.
 2. Invoke a supported local coding agent automatically.
 3. Support Codex, Claude Code, and OpenCode through subprocess adapters.
 4. Allow the user to select an agent and optionally select a model.
-5. Use a single LLMWiki agent skill for the complete ingest workflow.
+5. Use a single Cognitio agent skill for the complete ingest workflow.
 6. Use MinerU for PDF-to-Markdown conversion.
 7. Generate consistent academic paper pages in Markdown.
 8. Reuse and link existing concepts rather than creating unnecessary duplicates.
 9. Store the knowledge base in a local Git repository.
 10. Push the repository to GitHub.
 11. Render the repository using Quartz 5.
-12. Deploy the resulting site automatically using Cloudflare Pages or GitHub Pages.
+12. Deploy the resulting site automatically using GitHub Actions and GitHub Pages.
 13. Support wikilinks, backlinks, full-text search, local graph exploration, LaTeX, citations, and hover previews through Quartz.
 14. Provide a minimal menubar/tray interface for status and settings.
 
@@ -131,7 +131,7 @@ The product should:
 - allow users to edit generated Markdown manually;
 - allow the user to replace Codex with Claude Code or OpenCode;
 - allow the user to choose the agent's default model or override it;
-- remain useful even if LLMWiki is no longer installed;
+- remain useful even if Cognitio is no longer installed;
 - avoid proprietary knowledge formats;
 - keep the system simple enough that a knowledgeable user can understand the entire workflow.
 
@@ -142,7 +142,7 @@ The product should:
 The following are explicitly **not** required for v0.1:
 
 - hosted LLM inference;
-- LLMWiki-operated PDF parsing service;
+- Cognitio-operated PDF parsing service;
 - R2 as the canonical knowledge database;
 - D1 metadata database;
 - Vectorize;
@@ -183,7 +183,7 @@ Example workflow:
 ```text
 ~/Papers/Inbox
        ↓
-LLMWiki
+Cognitio
        ↓
 https://research.example.com
 ```
@@ -197,15 +197,17 @@ https://research.example.com
 On first launch:
 
 1. User selects a watch folder.
-2. LLMWiki detects supported local agents.
+2. Cognitio detects supported local agents.
 3. User selects Auto, Codex, Claude Code, or OpenCode.
 4. User optionally selects a model.
 5. User enters MinerU API credentials if needed.
 6. User selects or creates a GitHub repository.
-7. LLMWiki installs the LLMWiki agent skill.
-8. LLMWiki initializes or clones the knowledge repository.
-9. User connects the repository to Cloudflare Pages or GitHub Pages.
-10. LLMWiki begins watching the configured folder.
+7. Cognitio installs the Cognitio agent skill.
+8. Cognitio initializes or clones the knowledge repository.
+9. Cognitio enables GitHub Pages in Actions mode using the authenticated GitHub CLI.
+10. Cognitio begins watching the configured folder.
+
+Initialization runs as a cancellable background operation. The setup window displays stable phases and progress, closing the window does not stop the task, and an interrupted launch returns to a retryable setup state. No workspace is considered configured until its completion marker and Wiki Git repository both exist.
 
 After setup, the user should not need a primary application window.
 
@@ -216,9 +218,9 @@ User downloads paper.pdf
         ↓
 Moves paper.pdf into watched folder
         ↓
-LLMWiki detects stable new file
+Cognitio detects stable new file
         ↓
-LLMWiki selects configured AgentRunner
+Cognitio selects configured AgentRunner
         ↓
 Agent starts in local Wiki repository
         ↓
@@ -238,7 +240,7 @@ git commit
         ↓
 git push
         ↓
-Cloudflare Pages detects push
+GitHub Actions detects the push
         ↓
 Quartz build
         ↓
@@ -249,12 +251,12 @@ Wiki website updated
 
 ## 8. Product Surface
 
-LLMWiki should behave like a system utility, not a normal desktop app.
+Cognitio should behave like a system utility, not a normal desktop app.
 
 Example menubar:
 
 ```text
-LLMWiki
+Cognitio
 
 ● Watching ~/Papers/Inbox
 
@@ -310,7 +312,7 @@ Model
 ( ) <supported model override>
 ```
 
-Default must be **Agent Default**. LLMWiki must not hard-code a model.
+Default must be **Agent Default**. Cognitio must not hard-code a model.
 
 ### MinerU
 
@@ -333,7 +335,7 @@ Secrets should be stored in the OS credential store where practical and must nev
 
 ```text
 Wiki Repository
-~/LLMWiki/wiki
+~/Cognitio/wiki
 
 Git Remote
 github.com/user/my-llmwiki
@@ -379,7 +381,7 @@ The frontend is limited to:
 Recommended local directories:
 
 ```text
-~/LLMWiki/
+~/Cognitio/
 ├── inbox/
 ├── processing/
 ├── done/
@@ -412,7 +414,7 @@ The filesystem is sufficient as the v0.1 job-state model. SQLite is not required
 
 ### Decision
 
-LLMWiki v0.1 uses:
+Cognitio v0.1 uses:
 
 > **Direct subprocess execution of each agent's official non-interactive CLI.**
 
@@ -504,7 +506,7 @@ Agent Default
 
 or an explicit model.
 
-If no model is selected, LLMWiki passes no model override.
+If no model is selected, Cognitio passes no model override.
 
 If selected:
 
@@ -571,7 +573,7 @@ Reasons:
 - ACP support is not equally native across all providers;
 - ACP would make the menubar utility a more complex Agent Host.
 
-ACP may be introduced later if LLMWiki needs:
+ACP may be introduced later if Cognitio needs:
 
 - interactive approval UI;
 - live conversations;
@@ -584,7 +586,7 @@ The `AgentRunner` abstraction must permit a future `AcpRunner`.
 
 ---
 
-## 17. LLMWiki Skill
+## 17. Cognitio Skill
 
 The system installs one primary skill:
 
@@ -597,12 +599,10 @@ Recommended structure:
 ```text
 llmwiki/
 ├── SKILL.md
-├── references/
-│   ├── paper-format.md
-│   ├── concept-format.md
-│   └── writing-guide.md
-└── scripts/
-    └── parse-paper
+└── references/
+    ├── paper-format.md
+    ├── concept-format.md
+    └── writing-guide.md
 ```
 
 Do not split the v0.1 workflow into separate MinerU, analysis, Wiki, and publishing skills.
@@ -613,9 +613,9 @@ Do not split the v0.1 workflow into separate MinerU, analysis, Wiki, and publish
 
 The skill should instruct the agent to:
 
-1. Accept a PDF path.
-2. Parse the PDF with MinerU.
-3. Read the generated Markdown fully.
+1. Accept the source PDF metadata and Cognitio-provided Markdown path.
+2. Refuse to invoke MinerU, upload the PDF, or run another parser.
+3. Read the provided Markdown fully.
 4. Identify research question, motivation, contributions, method, experiments, limitations, and important concepts.
 5. Search the existing Wiki before creating concepts.
 6. Reuse canonical concepts where possible.
@@ -632,7 +632,7 @@ The skill should instruct the agent to:
 
 ## 19. MinerU Integration
 
-MinerU is not a first-class product subsystem.
+MinerU is an App-owned parsing adapter rather than an Agent capability.
 
 Its role is:
 
@@ -644,17 +644,15 @@ MinerU
 Markdown
 ```
 
-The rest of the LLMWiki workflow begins from Markdown.
+The rest of the Cognitio workflow begins from Markdown.
 
-The app may provide:
+The app provides a diagnostic CLI:
 
 ```bash
 llmwiki parse paper.pdf
 ```
 
-or the skill may call MinerU directly.
-
-v0.1 should avoid introducing MinerU MCP or a custom parsing service unless implementation constraints require them.
+The background worker calls the same Rust adapter before starting the Agent and reuses a non-empty task-local `parsed/full.md` on Retry. The Skill must not call MinerU directly. v0.1 does not introduce MinerU MCP or another parsing service.
 
 ---
 
@@ -667,7 +665,7 @@ Settings
  ↓
 OS Keychain
  ↓
-agent subprocess environment
+App-owned MinerU adapter
  ↓
 MinerU integration
 ```
@@ -936,7 +934,7 @@ Using Hugo would require rebuilding much of this knowledge-navigation layer.
 ### Homepage
 
 ```text
-LLMWiki
+Cognitio
 
 Search...
 
@@ -1015,16 +1013,14 @@ git push
      ↓
 GitHub
      ↓
-Cloudflare Pages
+GitHub Actions
      ↓
-Quartz build
+Quartz build and Pages artifact deployment
      ↓
-Published LLMWiki
+Published Cognitio
 ```
 
-GitHub Pages may be offered as an alternative.
-
-The local app should not need Cloudflare credentials merely to publish.
+The local app uses the existing authenticated `gh` session to enable Pages and does not store a separate GitHub token.
 
 ---
 
@@ -1036,7 +1032,7 @@ Reuse existing agent authentication wherever possible.
 - Claude authentication belongs to Claude Code.
 - OpenCode provider authentication belongs to OpenCode.
 
-LLMWiki should not ask users to duplicate OpenAI or Anthropic keys merely to invoke authenticated CLIs.
+Cognitio should not ask users to duplicate OpenAI or Anthropic keys merely to invoke authenticated CLIs.
 
 MinerU credentials are separate.
 
@@ -1078,7 +1074,7 @@ Success:
 ```text
 Mamba
 
-Added to LLMWiki
+Added to Cognitio
 3 concepts linked
 
 [Open Paper]
@@ -1089,7 +1085,7 @@ Failure:
 ```text
 Mamba.pdf
 
-LLMWiki could not complete this paper.
+Cognitio could not complete this paper.
 
 [View Error] [Retry]
 ```
@@ -1098,13 +1094,13 @@ LLMWiki could not complete this paper.
 
 ## 36. Privacy
 
-LLMWiki is local-first.
+Cognitio is local-first.
 
 By default:
 
 - the PDF remains local during processing;
 - agent execution happens through the user's selected local agent;
-- LLMWiki does not require its own hosted LLM service;
+- Cognitio does not require its own hosted LLM service;
 - only generated Markdown/assets are pushed to GitHub.
 
 Users remain subject to the privacy policies of their chosen agent, MinerU, GitHub, and hosting provider.
@@ -1182,7 +1178,7 @@ Sampled evaluation of:
 
 A user can:
 
-1. Install LLMWiki.
+1. Install Cognitio.
 2. Configure a watch folder.
 3. Select Codex, Claude Code, OpenCode, or Auto.
 4. Optionally override the model.
@@ -1243,12 +1239,7 @@ GitHub
 
 ```text
 Quartz 5
-Cloudflare Pages
-```
-
-Alternative hosting:
-
-```text
+GitHub Actions
 GitHub Pages
 ```
 
@@ -1275,7 +1266,7 @@ Add when Quartz search no longer scales.
 Possible future stack:
 
 ```text
-Cloudflare Worker
+Edge worker
 D1 FTS
 Vectorize
 hybrid retrieval
@@ -1292,7 +1283,7 @@ Add only if the product requires claim-level provenance or systematic evidence r
 
 ### ACP
 
-Add if LLMWiki evolves into a rich interactive Agent Client.
+Add if Cognitio evolves into a rich interactive Agent Client.
 
 ---
 
@@ -1304,11 +1295,11 @@ The core AI workflow runs on the user's machine.
 
 ### Existing Tools First
 
-Use Codex, Claude Code, OpenCode, MinerU, GitHub, Quartz, and Cloudflare rather than recreating them.
+Use Codex, Claude Code, OpenCode, MinerU, GitHub, and Quartz rather than recreating them.
 
 ### Markdown Is the Product
 
-The knowledge base must remain useful without LLMWiki.
+The knowledge base must remain useful without Cognitio.
 
 ### Git Is Enough Until It Isn't
 
@@ -1320,7 +1311,7 @@ v0.1 should have one primary workflow skill.
 
 ### Explicit Agent Invocation
 
-LLMWiki explicitly invokes its skill rather than hoping the agent discovers it.
+Cognitio explicitly invokes its skill rather than hoping the agent discovers it.
 
 ### Renderer Independence
 
@@ -1341,7 +1332,7 @@ Backlinks, graphs, and indexes are derived from Markdown rather than manually ma
                   │
                   ▼
         ┌──────────────────┐
-        │ LLMWiki Menubar  │
+        │ Cognitio Menubar  │
         │                  │
         │ watch            │
         │ settings         │
@@ -1388,17 +1379,17 @@ Backlinks, graphs, and indexes are derived from Markdown rather than manually ma
               Quartz 5
                  │
                  ▼
-        Cloudflare Pages
+         GitHub Pages
                  │
                  ▼
-          Academic LLMWiki
+          Academic Cognitio
 ```
 
 ---
 
 ## 45. Product Definition
 
-LLMWiki is:
+Cognitio is:
 
 > **A local-first academic knowledge compiler that turns papers into an interconnected Markdown Wiki using the coding agents users already have.**
 
