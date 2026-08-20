@@ -11,6 +11,7 @@ use crate::models::LogEntry;
 const LOG_FILE: &str = "activity.jsonl";
 const MAX_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_LOADED_ENTRIES: usize = 200;
+const MAX_MESSAGE_BYTES: usize = 2 * 1024;
 
 pub fn append(
     config_dir: &Path,
@@ -25,7 +26,7 @@ pub fn append(
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: Utc::now().to_rfc3339(),
         level: level.into(),
-        message: redact(message),
+        message: truncate(&redact(message)),
         job_id: job_id.map(str::to_owned),
     };
     let line =
@@ -37,6 +38,17 @@ pub fn append(
         .map_err(|error| format!("open log: {error}"))?;
     writeln!(file, "{line}").map_err(|error| format!("append log: {error}"))?;
     Ok(entry)
+}
+
+fn truncate(message: &str) -> String {
+    if message.len() <= MAX_MESSAGE_BYTES {
+        return message.into();
+    }
+    let mut end = MAX_MESSAGE_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} [truncated]", &message[..end])
 }
 
 pub fn load(config_dir: &Path) -> Vec<LogEntry> {
@@ -107,7 +119,7 @@ pub fn redact(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::redact;
+    use super::{redact, truncate, MAX_MESSAGE_BYTES};
 
     #[test]
     fn redacts_tokens_and_url_credentials() {
@@ -118,5 +130,12 @@ mod tests {
             value,
             "MINERU_TOKEN=[REDACTED] Authorization: Bearer [REDACTED] push https://[REDACTED]@example.com/repo"
         );
+    }
+
+    #[test]
+    fn truncates_large_messages_on_a_character_boundary() {
+        let value = truncate(&"论文".repeat(MAX_MESSAGE_BYTES));
+        assert!(value.ends_with(" [truncated]"));
+        assert!(value.len() <= MAX_MESSAGE_BYTES + " [truncated]".len());
     }
 }

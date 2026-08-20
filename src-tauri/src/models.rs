@@ -44,7 +44,7 @@ impl Default for AppSettings {
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
-        #[derive(Clone, Debug, Deserialize, Serialize)]
+        #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
         pub enum $name { $(#[serde(rename = $value)] $variant),+ }
     };
 }
@@ -103,6 +103,30 @@ pub struct JobSummary {
     pub created_at: String,
     pub updated_at: String,
     pub error: Option<String>,
+    pub allowed_actions: Vec<String>,
+    pub block_scope: Option<String>,
+    pub mineru_mode: Option<String>,
+    pub deployment: DeploymentSummary,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentSummary {
+    pub status: String,
+    pub url: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl Default for DeploymentSummary {
+    fn default() -> Self {
+        Self {
+            status: "notTracked".into(),
+            url: None,
+            error: None,
+            updated_at: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

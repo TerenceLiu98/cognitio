@@ -74,10 +74,11 @@ pub fn start(app: AppHandle) {
 
 fn scan_once(app: &AppHandle, tracker: &mut StabilityTracker) {
     let state = app.state::<AppState>();
-    let (enabled, workspace, mut known_hashes) = match state.snapshot.lock() {
+    let (enabled, workspace, settings, mut known_hashes) = match state.snapshot.lock() {
         Ok(snapshot) => (
             snapshot.configured && snapshot.watching,
             PathBuf::from(&snapshot.settings.workspace_root),
+            snapshot.settings.clone(),
             jobs::load_all(PathBuf::from(&snapshot.settings.workspace_root).as_path())
                 .into_iter()
                 .map(|job| job.sha256)
@@ -108,7 +109,7 @@ fn scan_once(app: &AppHandle, tracker: &mut StabilityTracker) {
             Observation::TimedOut => {
                 tracker.files.remove(&path);
                 let message = "PDF did not become stable within five minutes";
-                match jobs::create(&workspace, &path)
+                match jobs::create(&workspace, &path, &settings)
                     .and_then(|record| jobs::fail(&workspace, &record.id, message))
                 {
                     Ok(record) => {
@@ -143,7 +144,7 @@ fn scan_once(app: &AppHandle, tracker: &mut StabilityTracker) {
         if !known_hashes.insert(hash) {
             continue;
         }
-        match jobs::create(&workspace, &path) {
+        match jobs::create(&workspace, &path, &settings) {
             Ok(record) => {
                 if let Ok(entry) = logging::append(
                     &state.config_dir,

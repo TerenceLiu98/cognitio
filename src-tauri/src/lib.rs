@@ -18,9 +18,9 @@ mod worker;
 mod workspace;
 
 use commands::{
-    cancel_initialization, cancel_job, choose_workspace, export_diagnostics, get_app_snapshot,
-    initialize_workspace, open_target, retry_job, run_preflight, save_mineru_token, save_settings,
-    set_watching, AppState,
+    apply_settings, cancel_initialization, cancel_job, choose_workspace, export_diagnostics,
+    get_app_snapshot, initialize_workspace, open_target, retry_job, run_preflight, set_watching,
+    AppState,
 };
 use tauri::Manager;
 
@@ -113,8 +113,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
-            save_settings,
-            save_mineru_token,
+            apply_settings,
             choose_workspace,
             initialize_workspace,
             cancel_initialization,

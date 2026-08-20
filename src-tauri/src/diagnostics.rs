@@ -1,16 +1,27 @@
-use std::{fs, io::Write, path::Path};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use crate::{jobs, logging, models::AppSnapshot};
 
-pub fn export(destination: &Path, snapshot: &AppSnapshot, config_dir: &Path) -> Result<(), String> {
+pub fn export(
+    destination: &Path,
+    snapshot: &AppSnapshot,
+    config_dir: &Path,
+    include_detailed_logs: bool,
+) -> Result<(), String> {
     let file = fs::File::create(destination)
         .map_err(|error| format!("create diagnostics archive: {error}"))?;
     let mut archive = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     let mut safe_snapshot = snapshot.clone();
+    safe_snapshot.settings.workspace_root = "<workspace>".into();
     safe_snapshot.settings.git_remote = logging::redact(&safe_snapshot.settings.git_remote);
     safe_snapshot.settings.site_url = logging::redact(&safe_snapshot.settings.site_url);
+    safe_snapshot.logs.clear();
     add(
         &mut archive,
         "snapshot.json",
@@ -18,11 +29,22 @@ pub fn export(destination: &Path, snapshot: &AppSnapshot, config_dir: &Path) -> 
             .map_err(|error| format!("serialize diagnostics: {error}"))?,
         options,
     )?;
-    if let Ok(logs) = fs::read(config_dir.join("activity.jsonl")) {
-        add(&mut archive, "activity.jsonl", &logs, options)?;
+    if include_detailed_logs {
+        if let Ok(logs) = fs::read(config_dir.join("activity.jsonl")) {
+            add(&mut archive, "activity.jsonl", &logs, options)?;
+        }
     }
     let workspace = Path::new(&snapshot.settings.workspace_root);
-    for record in jobs::load_all(workspace) {
+    for mut record in jobs::load_all(workspace) {
+        record.source_path = PathBuf::from("inbox").join(&record.filename);
+        record.input_path = PathBuf::from("processing")
+            .join(&record.id)
+            .join(&record.filename);
+        record.archive_destination = record
+            .archive_destination
+            .as_ref()
+            .map(|_| PathBuf::from("<archive-destination>"));
+        record.error = record.error.as_deref().map(logging::redact);
         let bytes = serde_json::to_vec_pretty(&record)
             .map_err(|error| format!("serialize job diagnostics: {error}"))?;
         add(
@@ -93,7 +115,7 @@ mod tests {
             initialization: Default::default(),
         };
         let destination = root.join("diagnostics.zip");
-        export(&destination, &snapshot, &config_dir).expect("diagnostics export");
+        export(&destination, &snapshot, &config_dir, false).expect("diagnostics export");
 
         let file = fs::File::open(&destination).expect("archive");
         let mut archive = zip::ZipArchive::new(file).expect("zip archive");
@@ -107,6 +129,8 @@ mod tests {
         }
         assert!(!contents.contains("diagnostic-secret"));
         assert!(!contents.contains("remote-secret"));
+        assert!(!contents.contains(root.to_string_lossy().as_ref()));
+        assert!(!contents.contains("activity.jsonl"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

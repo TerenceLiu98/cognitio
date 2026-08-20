@@ -100,7 +100,7 @@ pub fn build_command(
     })
 }
 
-fn validate_version(kind: AgentKind, version: &str) -> Result<(), String> {
+pub fn validate_version(kind: AgentKind, version: &str) -> Result<(), String> {
     let number = version
         .split_whitespace()
         .find(|part| {
@@ -158,11 +158,18 @@ pub fn parse_event(line: &str) -> NormalizedEvent {
     } else {
         "message"
     };
-    let message = value
-        .get("message")
-        .or_else(|| value.get("text"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let message = [
+        "/message",
+        "/text",
+        "/item/text",
+        "/part/text",
+        "/message/content/0/text",
+        "/content/0/text",
+        "/result",
+    ]
+    .into_iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+    .map(str::to_owned);
     NormalizedEvent {
         kind: kind.into(),
         message,
@@ -203,5 +210,29 @@ mod tests {
             BTreeMap::new()
         )
         .is_err());
+    }
+
+    #[test]
+    fn normalizes_supported_agent_event_shapes() {
+        assert_eq!(
+            parse_event(r#"{"type":"item.completed","item":{"text":"codex done"}}"#)
+                .message
+                .as_deref(),
+            Some("codex done")
+        );
+        assert_eq!(
+            parse_event(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"claude done"}]}}"#
+            )
+            .message
+            .as_deref(),
+            Some("claude done")
+        );
+        assert_eq!(
+            parse_event(r#"{"type":"text","part":{"text":"opencode done"}}"#)
+                .message
+                .as_deref(),
+            Some("opencode done")
+        );
     }
 }

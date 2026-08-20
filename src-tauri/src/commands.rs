@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use crate::{
-    config, credentials, diagnostics, initialization,
+    agents, config, credentials, diagnostics, initialization,
     initialization::InitializationJournal,
     jobs, launch_at_login, logging,
     models::{AppSettings, AppSnapshot, InitializationSummary, PreflightItem, PreflightReport},
@@ -127,6 +127,12 @@ pub fn bootstrap(app: AppHandle) {
                     snapshot.clone()
                 };
                 publish_snapshot(&app, current.clone());
+                if current.configured {
+                    crate::worker::resume_deployment_monitors(
+                        app.clone(),
+                        PathBuf::from(&current.settings.workspace_root),
+                    );
+                }
                 if !current.configured {
                     tray::show_window(&app, "setup");
                 }
@@ -171,20 +177,25 @@ pub async fn get_app_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot,
     snapshot(&state)
 }
 
-#[tauri::command]
-pub async fn save_settings(
+async fn persist_settings(
     mut settings: AppSettings,
-    app: AppHandle,
-    state: State<'_, AppState>,
+    app: &AppHandle,
+    state: &State<'_, AppState>,
 ) -> Result<AppSnapshot, String> {
     if settings.schema_version != 3 {
         return Err("unsupported settings schema version".into());
     }
     settings.site_title = wiki::normalize_site_title(&settings.site_title)?;
-    let before = snapshot(&state)?;
+    let before = snapshot(state)?;
+    if before.configured && before.settings.git_remote != settings.git_remote {
+        return Err(
+            "the GitHub repository is fixed after initialization; use a new workspace to change it"
+                .into(),
+        );
+    }
     if before.configured && before.settings.site_title != settings.site_title {
         let _repository_guard = state.repository_operation.lock().await;
-        let current = snapshot(&state)?;
+        let current = snapshot(state)?;
         let busy = current.jobs.iter().any(|job| {
             matches!(
                 job.state.as_str(),
@@ -208,9 +219,14 @@ pub async fn save_settings(
         std::env::current_exe().map_err(|error| format!("resolve executable: {error}"))?;
     let config_dir = state.config_dir.clone();
     let persisted = settings.clone();
+    let previous_launch_at_login = before.settings.launch_at_login;
     tokio::task::spawn_blocking(move || {
         launch_at_login::configure(&home, &executable, persisted.launch_at_login)?;
-        config::save(&config_dir, &persisted)
+        if let Err(error) = config::save(&config_dir, &persisted) {
+            let _ = launch_at_login::configure(&home, &executable, previous_launch_at_login);
+            return Err(error);
+        }
+        Ok(())
     })
     .await
     .map_err(|error| format!("join settings save: {error}"))??;
@@ -222,35 +238,65 @@ pub async fn save_settings(
         current.settings = settings;
         current.clone()
     };
-    publish_snapshot(&app, current.clone());
+    publish_snapshot(app, current.clone());
     Ok(current)
 }
 
 #[tauri::command]
-pub async fn save_mineru_token(
+pub async fn apply_settings(
+    settings: AppSettings,
+    token_action: String,
     token: String,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AppSnapshot, String> {
-    let trimmed = token.trim().to_owned();
-    let config_dir = state.config_dir.clone();
-    let entry = tokio::task::spawn_blocking(move || {
-        credentials::store_mineru_token(&trimmed)?;
-        logging::append(&config_dir, "info", "MinerU credential updated", None)
-    })
-    .await
-    .map_err(|error| format!("join credential save: {error}"))??;
-    let current = {
-        let mut current = state
-            .snapshot
-            .lock()
-            .map_err(|_| "application state lock is poisoned".to_string())?;
-        current.mineru_token_configured = !token.trim().is_empty();
-        current.logs.push(entry);
-        current.clone()
+    let previous_token = tokio::task::spawn_blocking(credentials::mineru_token)
+        .await
+        .map_err(|error| format!("join credential read: {error}"))??;
+    let next_token = match token_action.as_str() {
+        "unchanged" => previous_token.clone(),
+        "set" => {
+            let value = token.trim();
+            if value.is_empty() {
+                return Err("a non-empty MinerU token is required for the set operation".into());
+            }
+            Some(value.to_owned())
+        }
+        "clear" => None,
+        _ => return Err("unknown MinerU token operation".into()),
     };
-    publish_snapshot(&app, current.clone());
-    Ok(current)
+    if settings.mineru_mode == crate::models::MineruMode::Precision && next_token.is_none() {
+        return Err("Precision mode requires a MinerU token in Keychain".into());
+    }
+    if token_action != "unchanged" {
+        let credential = next_token.clone().unwrap_or_default();
+        tokio::task::spawn_blocking(move || credentials::store_mineru_token(&credential))
+            .await
+            .map_err(|error| format!("join credential save: {error}"))??;
+    }
+    match persist_settings(settings, &app, &state).await {
+        Ok(mut current) => {
+            current.mineru_token_configured = next_token.is_some();
+            {
+                let mut snapshot = state
+                    .snapshot
+                    .lock()
+                    .map_err(|_| "application state lock is poisoned".to_string())?;
+                snapshot.mineru_token_configured = current.mineru_token_configured;
+            }
+            publish_snapshot(&app, current.clone());
+            Ok(current)
+        }
+        Err(error) => {
+            if token_action != "unchanged" {
+                let rollback = previous_token.unwrap_or_default();
+                let _ =
+                    tokio::task::spawn_blocking(move || credentials::store_mineru_token(&rollback))
+                        .await;
+            }
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -593,23 +639,32 @@ async fn run_preflight_inner(settings: &AppSettings) -> PreflightReport {
     let mineru_mode = settings.mineru_mode.clone();
     let detected = tokio::task::spawn_blocking(move || {
         let path = PathBuf::from(&workspace_root);
-        let workspace_ok =
-            !workspace_root.is_empty() && (!path.exists() || workspace::can_initialize(&path));
+        let initialized = workspace::is_initialized(&path);
+        let workspace_ok = !workspace_root.is_empty()
+            && (initialized || !path.exists() || workspace::can_initialize(&path));
+        let workspace_detail = if initialized {
+            Some("Initialized Cognitio workspace".into())
+        } else if workspace_ok {
+            Some("New, empty, or resumable workspace".into())
+        } else {
+            Some("Choose a new or Cognitio-managed folder".into())
+        };
         (
             workspace_ok,
+            workspace_detail,
             tools::detect_all(),
             !matches!(mineru_mode, crate::models::MineruMode::Precision)
                 || credentials::is_mineru_token_configured(),
         )
     })
     .await
-    .unwrap_or((false, Vec::new(), false));
-    let (workspace_ok, capabilities, mineru_ok) = detected;
+    .unwrap_or((false, None, Vec::new(), false));
+    let (workspace_ok, workspace_detail, capabilities, mineru_ok) = detected;
     let mut items = vec![PreflightItem {
         id: "workspace".into(),
         ok: workspace_ok,
-        message: "Workspace is writable and empty or resumable".into(),
-        detail: None,
+        message: "Workspace is ready for Cognitio".into(),
+        detail: workspace_detail,
     }];
     let git = capabilities.iter().find(|tool| tool.id == "git");
     items.push(PreflightItem {
@@ -625,25 +680,32 @@ async fn run_preflight_inner(settings: &AppSettings) -> PreflightReport {
         message: "GitHub CLI is authenticated".into(),
         detail: gh.and_then(|tool| tool.version.clone()),
     });
-    let agent_ok = match settings.agent_provider {
-        crate::models::AgentProvider::Auto => capabilities.iter().any(|tool| {
-            ["codex", "claude", "opencode"].contains(&tool.id.as_str()) && tool.detected
-        }),
-        crate::models::AgentProvider::Codex => capabilities
-            .iter()
-            .any(|tool| tool.id == "codex" && tool.detected),
-        crate::models::AgentProvider::Claude => capabilities
-            .iter()
-            .any(|tool| tool.id == "claude" && tool.detected),
-        crate::models::AgentProvider::Opencode => capabilities
-            .iter()
-            .any(|tool| tool.id == "opencode" && tool.detected),
+    let requested_agents: &[agents::AgentKind] = match settings.agent_provider {
+        crate::models::AgentProvider::Auto => &[
+            agents::AgentKind::Codex,
+            agents::AgentKind::Claude,
+            agents::AgentKind::Opencode,
+        ],
+        crate::models::AgentProvider::Codex => &[agents::AgentKind::Codex],
+        crate::models::AgentProvider::Claude => &[agents::AgentKind::Claude],
+        crate::models::AgentProvider::Opencode => &[agents::AgentKind::Opencode],
     };
+    let supported_agent = requested_agents.iter().find_map(|kind| {
+        capabilities
+            .iter()
+            .find(|tool| tool.id == kind.as_str() && tool.detected)
+            .and_then(|tool| {
+                tool.version
+                    .as_deref()
+                    .filter(|version| agents::validate_version(*kind, version).is_ok())
+                    .map(|version| format!("{} {version}", kind.as_str()))
+            })
+    });
     items.push(PreflightItem {
         id: "agent".into(),
-        ok: agent_ok,
-        message: "Selected agent is installed".into(),
-        detail: None,
+        ok: supported_agent.is_some(),
+        message: "Selected agent version is supported".into(),
+        detail: supported_agent,
     });
     items.push(PreflightItem {
         id: "mineru".into(),
@@ -711,18 +773,39 @@ pub async fn set_watching(
 #[tauri::command]
 pub async fn retry_job(
     job_id: String,
+    retry_mode: String,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AppSnapshot, String> {
-    update_job(
-        &job_id,
-        jobs::JobState::Queued,
-        "Waiting for processor",
-        10,
-        &app,
-        &state,
-    )
+    let force_reparse = match retry_mode.as_str() {
+        "reuse_valid" => false,
+        "force_reparse_current_mode" => true,
+        _ => return Err("unknown retry mode".into()),
+    };
+    let current = snapshot(&state)?;
+    let workspace = current.settings.workspace_root.clone();
+    let settings = current.settings;
+    let id = job_id.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        jobs::retry(Path::new(&workspace), &id, &settings, force_reparse)
+    })
     .await
+    .map_err(|error| format!("join job retry: {error}"))??;
+    let current = {
+        let mut value = state
+            .snapshot
+            .lock()
+            .map_err(|_| "application state lock is poisoned".to_string())?;
+        let summary = (&record).into();
+        if let Some(existing) = value.jobs.iter_mut().find(|job| job.id == job_id) {
+            *existing = summary;
+        } else {
+            value.jobs.insert(0, summary);
+        }
+        value.clone()
+    };
+    publish_snapshot(&app, current.clone());
+    Ok(current)
 }
 
 #[tauri::command]
@@ -800,6 +883,7 @@ pub async fn open_target(target: String, state: State<'_, AppState>) -> Result<(
 
 #[tauri::command]
 pub async fn export_diagnostics(
+    include_detailed_logs: bool,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
@@ -823,8 +907,10 @@ pub async fn export_diagnostics(
     let current = snapshot(&state)?;
     let config_dir = state.config_dir.clone();
     let destination = path.clone();
-    tokio::task::spawn_blocking(move || diagnostics::export(&destination, &current, &config_dir))
-        .await
-        .map_err(|error| format!("join diagnostics export: {error}"))??;
+    tokio::task::spawn_blocking(move || {
+        diagnostics::export(&destination, &current, &config_dir, include_detailed_logs)
+    })
+    .await
+    .map_err(|error| format!("join diagnostics export: {error}"))??;
     Ok(Some(path.to_string_lossy().into_owned()))
 }

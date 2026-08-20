@@ -367,6 +367,10 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             error: None,
+            allowed_actions: vec!["cancel".into()],
+            block_scope: None,
+            mineru_mode: Some("precision".into()),
+            deployment: Default::default(),
         });
         snapshot.jobs.insert(
             0,
@@ -380,6 +384,10 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
                 error: None,
+                allowed_actions: vec!["cancel".into()],
+                block_scope: None,
+                mineru_mode: Some("precision".into()),
+                deployment: Default::default(),
             },
         );
 
