@@ -1,1321 +1,641 @@
 use std::{
-    collections::BTreeMap,
-    fs,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
+use tauri::{AppHandle, Manager};
+use tokio::task::JoinSet;
 
-use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::{Child, Command},
-    sync::mpsc,
-};
-
+#[cfg(test)]
+use crate::models::DeploymentSummary;
 use crate::{
+    agent_process::{self, AgentOutcome},
     agents,
-    commands::AppState,
-    jobs::{self, BlockScope, JobRecord, JobState},
-    logging, mineru,
-    models::{AfterProcessing, AppSnapshot, DeploymentSummary},
-    tray,
+    app_events::{append_log, notify, publish_record},
+    app_state::AppState,
+    archive,
+    git::output as git_output,
+    job_runtime::{Execution, JobRuntime},
+    jobs::{self, BlockReason, BlockScope, JobEvent, JobRecord, JobStage, JobState},
+    parsing,
+    publication::{self, PublicationOutcome},
+    tools,
 };
 
-const AGENT_TOTAL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ParseManifest {
-    schema_version: u32,
-    source_sha256: String,
-    mode: String,
-    profile_version: String,
-    markdown_sha256: String,
-    markdown_size: u64,
-    completed_at: String,
-}
-
-enum AgentStreamEvent {
-    Stdout(String),
-    Stderr(String),
-    Error(String),
-}
+const MAX_CONCURRENT_JOBS: usize = 3;
 
 pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        let mut tasks = JoinSet::new();
+        let mut active: HashMap<tokio::task::Id, Execution> = HashMap::new();
         loop {
-            let lookup_app = app.clone();
-            let record = tokio::task::spawn_blocking(move || next_job(&lookup_app))
-                .await
-                .unwrap_or(None);
-            if let Some(record) = record {
-                process(&app, record).await;
-            } else {
+            while active.len() < MAX_CONCURRENT_JOBS {
+                let lookup_app = app.clone();
+                let active_ids = active
+                    .values()
+                    .map(|execution| execution.record.id.clone())
+                    .collect();
+                let record =
+                    tokio::task::spawn_blocking(move || next_job(&lookup_app, &active_ids))
+                        .await
+                        .unwrap_or(None);
+                let Some(record) = record else {
+                    break;
+                };
+                let execution = record.clone();
+                let task_app = app.clone();
+                let handle = tasks.spawn(async move {
+                    process(&task_app, &record).await;
+                });
+                active.insert(handle.id(), execution);
+            }
+
+            if tasks.is_empty() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+            } else {
+                tokio::select! {
+                    result = tasks.join_next_with_id() => {
+                        if let Some(result) = result {
+                            let task_id = match result {
+                                Ok((task_id, ())) => task_id,
+                                Err(error) => {
+                                    append_log(
+                                        &app,
+                                        "error",
+                                        &format!("Worker task stopped unexpectedly: {error}"),
+                                        active.get(&error.id()).map(|execution| execution.record.id.as_str()),
+                                    )
+                                    .await;
+                                    error.id()
+                                }
+                            };
+                            if let Some(execution) = active.remove(&task_id) {
+                                let runtime = app.state::<AppState>().jobs.clone();
+                                let workspace = execution.workspace.clone();
+                                match tokio::task::spawn_blocking(move || runtime.finish(&execution, None)).await {
+                                    Ok(Ok(record)) => {
+                                        publish_record(&app, &record);
+                                        if record.state == JobState::Succeeded {
+                                            notify("Added to Cognitio", &record.filename);
+                                            crate::deployment::monitor(app.clone(), workspace, record.id.clone(), record.task_commit.clone());
+                                        }
+                                    },
+                                    result => append_log(&app, "error", &format!("Could not finalize execution: {result:?}"), None).await,
+                                }
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
             }
         }
     });
 }
 
-pub fn resume_deployment_monitors(app: AppHandle, workspace: PathBuf) {
-    let records = jobs::load_all(&workspace);
-    for record in records.into_iter().filter(|record| {
-        record.state == JobState::Succeeded
-            && matches!(
-                record.deployment.status.as_str(),
-                "pending" | "running" | "unknown"
-            )
-    }) {
-        monitor_deployment(
-            app.clone(),
-            workspace.clone(),
-            record.id,
-            record.published_commit,
-        );
-    }
-}
-
-fn next_job(app: &AppHandle) -> Option<JobRecord> {
+fn next_job(app: &AppHandle, active: &BTreeSet<String>) -> Option<Execution> {
     let state = app.state::<AppState>();
     let snapshot = state.snapshot.lock().ok()?;
     if !snapshot.configured || !snapshot.watching {
         return None;
     }
-    let records = jobs::load_all(Path::new(&snapshot.settings.workspace_root));
+    let workspace = PathBuf::from(&snapshot.settings.workspace_root);
+    drop(snapshot);
+    let records = match jobs::load_all(&workspace) {
+        Ok(records) => records,
+        Err(error) => {
+            if let Ok(mut snapshot) = state.snapshot.lock() {
+                snapshot.watching = false;
+            }
+            crate::app_events::append_log_blocking(app, "error", &error, None);
+            return None;
+        }
+    };
     if records.iter().any(|job| {
         job.state == JobState::Blocked && job.block_scope == Some(BlockScope::Repository)
     }) {
         return None;
     }
-    records.into_iter().rev().find(|job| {
-        matches!(
-            job.state,
-            JobState::Queued | JobState::Verifying | JobState::Archiving
-        )
+    let record = select_next_job(records, active)?;
+    let execution = state.jobs.claim(&workspace, &record.id).ok()?;
+    publish_record(app, &execution.record);
+    Some(execution)
+}
+
+fn select_next_job(records: Vec<JobRecord>, active: &BTreeSet<String>) -> Option<JobRecord> {
+    [JobState::Archiving, JobState::Verifying, JobState::Queued]
+        .into_iter()
+        .find_map(|state| {
+            records
+                .iter()
+                .rev()
+                .find(|job| job.state == state && !active.contains(&job.id))
+                .cloned()
+        })
+}
+
+async fn repository_blocked_by_other(workspace: &Path, job_id: &str) -> Result<bool, String> {
+    let workspace = workspace.to_path_buf();
+    let job_id = job_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        jobs::load_all(&workspace).map(|records| {
+            records.into_iter().any(|job| {
+                job.id != job_id
+                    && job.state == JobState::Blocked
+                    && job.block_scope == Some(BlockScope::Repository)
+            })
+        })
     })
+    .await
+    .map_err(|error| format!("join repository block lookup: {error}"))?
 }
 
-async fn process(app: &AppHandle, record: JobRecord) {
-    let state = app.state::<AppState>();
-    let _repository_guard = state.repository_operation.lock().await;
-    if let Err(error) = run_pipeline(app, &record).await {
-        if recover_pipeline_error(app, &record).await.unwrap_or(false) {
-            return;
+async fn process(app: &AppHandle, run: &Execution) {
+    let runtime = app.state::<AppState>().jobs.clone();
+    let result = run_pipeline(&runtime, run).await;
+    if run.is_cancelled() {
+        let _ = reconcile_interruption(&runtime, run, true).await;
+        return;
+    }
+    if let Err(error) = result {
+        match reconcile_interruption(&runtime, run, false).await {
+            Ok(true) => return,
+            Err(recovery_error) => run.log("error", &recovery_error),
+            Ok(false) => {}
         }
-        let failure_app = app.clone();
-        let failure_record = record.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || fail_job(&failure_app, &failure_record, &error))
-                .await;
+        if let Err(update_error) = run.apply(JobEvent::Failed(error.clone())).await {
+            run.log("error", &update_error);
+        }
+        run.log("error", &error);
     }
 }
 
-async fn recover_pipeline_error(app: &AppHandle, record: &JobRecord) -> Result<bool, String> {
-    let state = app.state::<AppState>();
-    let settings = state
-        .snapshot
-        .lock()
-        .map_err(|_| "application state lock is poisoned".to_string())?
-        .settings
-        .clone();
-    let workspace = PathBuf::from(settings.workspace_root);
-    let load_workspace = workspace.clone();
-    let load_id = record.id.clone();
-    let current = tokio::task::spawn_blocking(move || jobs::load(&load_workspace, &load_id))
+async fn load_current(run: &Execution) -> Result<JobRecord, String> {
+    let workspace = run.workspace.clone();
+    let id = run.record.id.clone();
+    tokio::task::spawn_blocking(move || jobs::load(&workspace, &id))
         .await
-        .map_err(|error| format!("join job reload: {error}"))??;
-    if current.state == JobState::Cancelled {
-        return Ok(true);
+        .map_err(|error| format!("join job load: {error}"))?
+}
+
+async fn reconcile_interruption(
+    runtime: &JobRuntime,
+    run: &Execution,
+    cancelled: bool,
+) -> Result<bool, String> {
+    let current = load_current(run).await?;
+    if current.base_commit.is_none() {
+        return Ok(cancelled);
     }
-    if current.base_commit.is_none() || current.state != JobState::Running {
+    if !matches!(
+        current.state,
+        JobState::Running | JobState::Verifying | JobState::Cancelling
+    ) {
+        return Ok(cancelled);
+    }
+    let guard = runtime.repository.lock().await;
+    let trigger = if cancelled {
+        crate::recovery::Trigger::Cancellation
+    } else {
+        crate::recovery::Trigger::Failure
+    };
+    let decision = crate::recovery::inspect(&run.workspace, &current, trigger).await;
+    if decision == crate::recovery::Decision::Keep {
         return Ok(false);
     }
-    let wiki = workspace.join("wiki");
-    if !git_output(&wiki, &["status", "--porcelain"])
-        .await?
-        .is_empty()
-    {
-        block_job(
-            app,
-            &workspace,
-            &record.id,
-            "Agent stopped with uncommitted Wiki changes",
-            BlockScope::Repository,
-        )
-        .await?;
-        return Ok(true);
+    let workspace = run.workspace.clone();
+    let updated = tokio::task::spawn_blocking(move || {
+        jobs::apply_recovery(&workspace, &current, decision, false)
+    })
+    .await
+    .map_err(|error| format!("join interruption recovery: {error}"))??;
+    run.publish(&updated);
+    if updated.state == JobState::Verifying {
+        let outcome =
+            publication::verify(&updated, &run.workspace, updated.base_commit.as_deref()).await?;
+        drop(guard);
+        finish_publication(run, outcome).await?;
+    } else if updated.state == JobState::Archiving {
+        drop(guard);
+        archive_and_succeed(run, &updated).await?;
     }
-    let lookup_wiki = wiki.clone();
-    let lookup_record = current.clone();
-    let commit =
-        tokio::task::spawn_blocking(move || jobs::find_job_commit(&lookup_wiki, &lookup_record))
-            .await
-            .map_err(|error| format!("join interrupted commit lookup: {error}"))??;
-    if commit.is_none() {
-        return Ok(false);
-    }
-    transition(
-        app,
-        &workspace,
-        &record.id,
-        JobState::Verifying,
-        "Resuming Git publication",
-        85,
-    )
-    .await?;
-    let execution = current
-        .execution
-        .as_ref()
-        .ok_or_else(|| "job has no captured execution settings".to_string())?;
-    verify_publication(
-        app,
-        &current,
-        &workspace,
-        current.base_commit.as_deref(),
-        &execution.after_processing,
-    )
-    .await?;
     Ok(true)
 }
 
-async fn run_pipeline(app: &AppHandle, record: &JobRecord) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let app_settings = state
-        .snapshot
-        .lock()
-        .map_err(|_| "application state lock is poisoned".to_string())?
-        .settings
-        .clone();
-    let workspace = PathBuf::from(&app_settings.workspace_root);
+async fn run_pipeline(runtime: &JobRuntime, run: &Execution) -> Result<(), String> {
+    run_pipeline_with(runtime, run, &LocalAdapters).await
+}
+
+trait PipelineAdapters {
+    async fn detect(&self) -> Result<Vec<crate::models::ToolCapability>, String>;
+    async fn parse(&self, run: &Execution, output: &Path) -> Result<Option<PathBuf>, String>;
+    async fn generate(
+        &self,
+        run: &Execution,
+        agent: agents::AgentKind,
+        version: &str,
+        wiki: &Path,
+        markdown: &Path,
+    ) -> Result<AgentOutcome, String>;
+}
+
+struct LocalAdapters;
+
+impl PipelineAdapters for LocalAdapters {
+    async fn detect(&self) -> Result<Vec<crate::models::ToolCapability>, String> {
+        tokio::task::spawn_blocking(tools::detect_all)
+            .await
+            .map_err(|error| format!("join agent detection: {error}"))
+    }
+
+    async fn parse(&self, run: &Execution, output: &Path) -> Result<Option<PathBuf>, String> {
+        let settings = run
+            .record
+            .execution
+            .as_ref()
+            .ok_or("missing execution settings")?;
+        parsing::prepare(run, output, settings.mineru_mode.clone()).await
+    }
+
+    async fn generate(
+        &self,
+        run: &Execution,
+        agent: agents::AgentKind,
+        version: &str,
+        wiki: &Path,
+        markdown: &Path,
+    ) -> Result<AgentOutcome, String> {
+        let settings = run
+            .record
+            .execution
+            .as_ref()
+            .ok_or("missing execution settings")?;
+        agent_process::run(
+            run,
+            agent,
+            version,
+            wiki,
+            markdown,
+            settings.model.as_deref(),
+        )
+        .await
+    }
+}
+
+async fn run_pipeline_with(
+    runtime: &JobRuntime,
+    run: &Execution,
+    adapters: &impl PipelineAdapters,
+) -> Result<(), String> {
+    let record = &run.record;
+    let workspace = &run.workspace;
     let wiki = workspace.join("wiki");
-    let execution = record
+    let settings = record
         .execution
-        .clone()
-        .ok_or_else(|| "job has no captured execution settings; retry it first".to_string())?;
+        .as_ref()
+        .ok_or("job has no captured execution settings; retry it first")?;
     if record.state == JobState::Archiving {
-        return archive_and_succeed(app, record, &workspace, &execution.after_processing).await;
+        return archive_and_succeed(run, record).await;
     }
     if record.state == JobState::Verifying {
-        return verify_publication(
-            app,
-            record,
-            &workspace,
-            record.base_commit.as_deref(),
-            &execution.after_processing,
-        )
-        .await;
+        let guard = runtime.repository.lock().await;
+        let outcome = publication::verify(record, workspace, record.base_commit.as_deref()).await?;
+        drop(guard);
+        return finish_publication(run, outcome).await;
     }
-    transition(
-        app,
-        &workspace,
-        &record.id,
-        JobState::Preflight,
-        "Checking Wiki and agent",
-        15,
-    )
-    .await?;
 
+    run.apply(JobEvent::Advance(JobStage::Preflight)).await?;
+    let detected = adapters.detect().await?;
+    let (agent, version) = agents::select_supported(&settings.agent_provider, &detected)?;
+    run.apply(JobEvent::Advance(JobStage::Parsing)).await?;
+    let output = workspace.join("processing").join(&record.id).join("parsed");
+    let Some(markdown) = adapters.parse(run, &output).await? else {
+        return Ok(());
+    };
+    run.apply(JobEvent::Advance(JobStage::WaitingForWiki))
+        .await?;
+
+    let guard = loop {
+        if run.is_cancelled() {
+            return Ok(());
+        }
+        let guard = tokio::select! {
+            guard = runtime.repository.lock() => guard,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => continue,
+        };
+        if !repository_blocked_by_other(workspace, &record.id).await? {
+            break guard;
+        }
+        drop(guard);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    if run.is_cancelled() {
+        return Ok(());
+    }
     if !git_output(&wiki, &["status", "--porcelain"])
         .await?
         .is_empty()
     {
-        return block_job(
-            app,
-            &workspace,
-            &record.id,
-            "Wiki has uncommitted changes",
+        return block(
+            run,
+            BlockReason::RepositoryDirty,
             BlockScope::Repository,
+            "Wiki has uncommitted changes",
         )
         .await;
     }
     git_output(&wiki, &["pull", "--ff-only"]).await?;
-    let before = git_output(&wiki, &["rev-parse", "HEAD"]).await?;
-    let mut detected = Vec::new();
-    for kind in [
-        agents::AgentKind::Codex,
-        agents::AgentKind::Claude,
-        agents::AgentKind::Opencode,
-    ] {
-        if let Some(version) = command_version(kind).await {
-            detected.push((kind, version));
-        }
-    }
-    let selected = agents::select(&execution.agent_provider, |kind| {
-        detected.iter().any(|(candidate, _)| *candidate == kind)
-    })?;
-    let version = detected
-        .iter()
-        .find(|(kind, _)| *kind == selected)
-        .map(|(_, version)| version.clone())
-        .ok_or_else(|| "selected agent version is unavailable".to_string())?;
-    let execution_workspace = workspace.clone();
-    let execution_id = record.id.clone();
-    let execution_agent = selected.as_str().to_owned();
-    let execution_before = before.trim().to_owned();
-    tokio::task::spawn_blocking(move || {
-        jobs::set_execution(
-            &execution_workspace,
-            &execution_id,
-            &execution_agent,
-            &execution_before,
-        )
+    let baseline = git_output(&wiki, &["rev-parse", "HEAD"]).await?;
+    run.apply(JobEvent::ExecutionMetadata {
+        agent: agent.as_str().into(),
+        base_commit: baseline.clone(),
     })
-    .await
-    .map_err(|error| format!("join execution metadata save: {error}"))??;
-    let parse_output = workspace.join("processing").join(&record.id).join("parsed");
-    transition(
-        app,
-        &workspace,
-        &record.id,
-        JobState::Running,
-        "Parsing PDF with MinerU",
-        25,
-    )
     .await?;
-    let Some(parsed_markdown) =
-        prepare_markdown(app, record, &parse_output, execution.mineru_mode.clone()).await?
-    else {
-        return Ok(());
-    };
-    update_phase(
-        app,
-        &workspace,
-        &record.id,
-        &format!("Running {}", selected.as_str()),
-        45,
-    )
-    .await?;
-    let prompt = format!("Use $llmwiki to process the already parsed Markdown at {}. The job id is {}. Do not invoke MinerU, upload a document, or run any parser. Validate the content, commit, and push before returning success. Do not install dependencies or run Quartz locally; GitHub Actions owns the site build.", parsed_markdown.display(), record.id);
-    let mut env = minimal_environment(selected);
-    env.insert(
-        "LLMWIKI_PARSED_MARKDOWN".into(),
-        parsed_markdown.to_string_lossy().into_owned(),
-    );
-    env.insert("LLMWIKI_JOB_ID".into(), record.id.clone());
-    let spec = agents::build_command(
-        selected,
-        &version,
-        &wiki,
-        &prompt,
-        execution.model.as_deref(),
-        env,
-    )?;
-    let mut command = Command::new(&spec.executable);
-    command
-        .args(&spec.args)
-        .current_dir(&wiki)
-        .env_clear()
-        .envs(&spec.env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("start {}: {error}", selected.as_str()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "agent stdout is unavailable".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "agent stderr is unavailable".to_string())?;
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
-    let stdout_tx = output_tx.clone();
-    tauri::async_runtime::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if stdout_tx.send(AgentStreamEvent::Stdout(line)).is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = stdout_tx.send(AgentStreamEvent::Error(format!(
-                        "read agent stdout: {error}"
-                    )));
-                    break;
-                }
-            }
-        }
-    });
-    let stderr_tx = output_tx.clone();
-    tauri::async_runtime::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if stderr_tx.send(AgentStreamEvent::Stderr(line)).is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = stderr_tx.send(AgentStreamEvent::Error(format!(
-                        "read agent stderr: {error}"
-                    )));
-                    break;
-                }
-            }
-        }
-    });
-    drop(output_tx);
-    let started = std::time::Instant::now();
-    let mut last_activity = started;
-    loop {
-        tokio::select! {
-            output = output_rx.recv() => match output {
-                Some(AgentStreamEvent::Stdout(line)) => {
-                    last_activity = std::time::Instant::now();
-                    let event = agents::parse_event(&line);
-                    if let Some(message) = event.message {
-                        append_log(app, "info", &message, Some(&record.id)).await;
-                    }
-                }
-                Some(AgentStreamEvent::Stderr(line)) => {
-                    last_activity = std::time::Instant::now();
-                    append_log(app, "warn", &line, Some(&record.id)).await;
-                }
-                Some(AgentStreamEvent::Error(error)) => {
-                    stop_agent(&mut child, "stop agent after output failure").await?;
-                    return Err(error);
-                }
-                None => break,
-            },
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                if is_cancelled(app, &record.id) {
-                    stop_agent(&mut child, "cancel agent").await?;
-                    return Ok(());
-                }
-                if let Some(error) = agent_timeout_error(started.elapsed(), last_activity.elapsed()) {
-                    stop_agent(&mut child, "stop timed-out agent").await?;
-                    return Err(error);
-                }
-            }
-        }
-    }
-    let status = child
-        .wait()
-        .await
-        .map_err(|error| format!("wait for agent: {error}"))?;
-    if !status.success() {
-        return Err(format!("{} exited with status {status}", selected.as_str()));
-    }
-    if is_cancelled(app, &record.id) {
-        return Ok(());
-    }
-
-    transition(
-        app,
-        &workspace,
-        &record.id,
-        JobState::Verifying,
-        "Verifying Git publication",
-        85,
-    )
-    .await?;
-    verify_publication(
-        app,
-        record,
-        &workspace,
-        Some(before.trim()),
-        &execution.after_processing,
-    )
-    .await
-}
-
-async fn prepare_markdown(
-    app: &AppHandle,
-    record: &JobRecord,
-    output: &Path,
-    mode: crate::models::MineruMode,
-) -> Result<Option<PathBuf>, String> {
-    if record.force_reparse && output.exists() {
-        tokio::fs::remove_dir_all(output)
-            .await
-            .map_err(|error| format!("clear previous MinerU output: {error}"))?;
-    }
-    if !record.force_reparse {
-        if let Some(existing) = reusable_markdown(output, record, &mode).await {
-            append_log(
-                app,
-                "info",
-                "Reusing verified MinerU Markdown",
-                Some(&record.id),
-            )
-            .await;
-            return Ok(Some(existing));
-        }
-    }
-    let parse_mode = match mode {
-        crate::models::MineruMode::Precision => mineru::ParseMode::Precision,
-        crate::models::MineruMode::Flash => mineru::ParseMode::Flash,
-    };
-    let parse = mineru::parse(&record.input_path, output, parse_mode);
-    tokio::pin!(parse);
-    let parsed = loop {
-        tokio::select! {
-            result = &mut parse => break result?,
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                if is_cancelled(app, &record.id) {
-                    return Ok(None);
-                }
-            }
-        }
-    };
-    let hash_path = parsed.clone();
-    let markdown_sha256 = tokio::task::spawn_blocking(move || jobs::sha256(&hash_path))
-        .await
-        .map_err(|error| format!("join Markdown checksum: {error}"))??;
-    let markdown_size = tokio::fs::metadata(&parsed)
-        .await
-        .map_err(|error| format!("read parsed Markdown metadata: {error}"))?
-        .len();
-    if markdown_size == 0 {
-        return Err("MinerU returned empty Markdown".into());
-    }
-    let manifest = ParseManifest {
-        schema_version: 1,
-        source_sha256: record.sha256.clone(),
-        mode: mineru_mode_name(&mode).into(),
-        profile_version: mineru::PROFILE_VERSION.into(),
-        markdown_sha256,
-        markdown_size,
-        completed_at: chrono::Utc::now().to_rfc3339(),
-    };
-    let temporary = output.join(".manifest.json.tmp");
-    tokio::fs::write(
-        &temporary,
-        serde_json::to_vec_pretty(&manifest)
-            .map_err(|error| format!("serialize MinerU manifest: {error}"))?,
-    )
-    .await
-    .map_err(|error| format!("write MinerU manifest: {error}"))?;
-    tokio::fs::rename(&temporary, output.join("manifest.json"))
-        .await
-        .map_err(|error| format!("finish MinerU manifest: {error}"))?;
-    let clear_workspace = record
-        .input_path
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-    if let Some(workspace) = clear_workspace {
-        let clear_id = record.id.clone();
-        if let Ok(Ok(updated)) =
-            tokio::task::spawn_blocking(move || jobs::clear_force_reparse(&workspace, &clear_id))
-                .await
-        {
-            publish_record(app, &updated);
-        }
-    }
-    Ok(Some(parsed))
-}
-
-async fn reusable_markdown(
-    output: &Path,
-    record: &JobRecord,
-    mode: &crate::models::MineruMode,
-) -> Option<PathBuf> {
-    let manifest: ParseManifest =
-        serde_json::from_slice(&tokio::fs::read(output.join("manifest.json")).await.ok()?).ok()?;
-    if manifest.schema_version != 1
-        || manifest.source_sha256 != record.sha256
-        || manifest.mode != mineru_mode_name(mode)
-        || manifest.profile_version != mineru::PROFILE_VERSION
-    {
-        return None;
-    }
-    let markdown = output.join("full.md");
-    let metadata = tokio::fs::metadata(&markdown).await.ok()?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() != manifest.markdown_size {
-        return None;
-    }
-    let hash_path = markdown.clone();
-    let checksum = tokio::task::spawn_blocking(move || jobs::sha256(&hash_path))
-        .await
-        .ok()?
-        .ok()?;
-    (checksum == manifest.markdown_sha256).then_some(markdown)
-}
-
-fn mineru_mode_name(mode: &crate::models::MineruMode) -> &'static str {
-    match mode {
-        crate::models::MineruMode::Precision => "precision",
-        crate::models::MineruMode::Flash => "flash",
-    }
-}
-
-fn agent_timeout_error(total: Duration, idle: Duration) -> Option<String> {
-    if total >= AGENT_TOTAL_TIMEOUT {
-        Some("agent timed out after 60 minutes".into())
-    } else if idle >= AGENT_IDLE_TIMEOUT {
-        Some("agent produced no output for 10 minutes".into())
-    } else {
-        None
-    }
-}
-
-async fn stop_agent(child: &mut Child, action: &str) -> Result<(), String> {
-    #[cfg(unix)]
-    if let Some(pid) = child
-        .id()
-        .and_then(|pid| i32::try_from(pid).ok())
-        .and_then(rustix::process::Pid::from_raw)
-    {
-        if rustix::process::kill_process_group(pid, rustix::process::Signal::TERM).is_ok() {
-            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-                Ok(result) => {
-                    result.map_err(|error| format!("{action}: {error}"))?;
-                    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-                    return Ok(());
-                }
-                Err(_) => {
-                    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-                    child
-                        .wait()
-                        .await
-                        .map_err(|error| format!("{action}: {error}"))?;
-                    return Ok(());
-                }
-            }
-        }
-    }
-    child
-        .kill()
-        .await
-        .map_err(|error| format!("{action}: {error}"))
-}
-
-async fn verify_publication(
-    app: &AppHandle,
-    record: &JobRecord,
-    workspace: &Path,
-    base_commit: Option<&str>,
-    after_processing: &AfterProcessing,
-) -> Result<(), String> {
-    let wiki = workspace.join("wiki");
-    let Some(base_commit) = base_commit else {
-        return block_job(
-            app,
-            workspace,
-            &record.id,
-            "Job has no recorded baseline commit",
-            BlockScope::Job,
-        )
-        .await;
-    };
-    if !git_output(&wiki, &["status", "--porcelain"])
+    run.apply(JobEvent::Advance(JobStage::Generating)).await?;
+    if adapters
+        .generate(run, agent, version, &wiki, &markdown)
         .await?
-        .is_empty()
+        == AgentOutcome::Cancelled
     {
-        return block_job(
-            app,
-            workspace,
-            &record.id,
-            "Wiki is not clean after agent completion",
-            BlockScope::Repository,
-        )
-        .await;
-    }
-
-    let range = format!("{base_commit}..HEAD");
-    let commit_count = git_output(&wiki, &["rev-list", "--count", &range])
-        .await?
-        .parse::<u32>()
-        .map_err(|error| format!("parse task commit count: {error}"))?;
-    if commit_count == 0 {
-        return block_job(
-            app,
-            workspace,
-            &record.id,
-            "Agent did not create a commit",
-            BlockScope::Job,
-        )
-        .await;
-    }
-    if commit_count != 1 {
-        return block_job(
-            app,
-            workspace,
-            &record.id,
-            "The job must produce exactly one commit",
-            BlockScope::Repository,
-        )
-        .await;
-    }
-
-    let lookup_wiki = wiki.clone();
-    let lookup_record = record.clone();
-    let commit =
-        tokio::task::spawn_blocking(move || jobs::find_job_commit(&lookup_wiki, &lookup_record))
-            .await
-            .map_err(|error| format!("join task commit lookup: {error}"))??;
-    let Some(commit) = commit else {
-        return block_job(
-            app,
-            workspace,
-            &record.id,
-            "Task commit is missing the Cognitio-Job trailer",
-            BlockScope::Repository,
-        )
-        .await;
-    };
-    let changed = git_output(
-        &wiki,
-        &["diff-tree", "--no-commit-id", "--name-only", "-r", &commit],
-    )
-    .await?;
-    if let Some(path) = changed.lines().find(|path| !allowed_wiki_path(path)) {
-        return block_job(
-            app,
-            workspace,
-            &record.id,
-            &format!("Task commit changed a disallowed path: {path}"),
-            BlockScope::Repository,
-        )
-        .await;
-    }
-
-    let publish_workspace = workspace.to_path_buf();
-    let publish_id = record.id.clone();
-    let publish_commit = commit.clone();
-    let published = tokio::task::spawn_blocking(move || {
-        jobs::set_published_commit(&publish_workspace, &publish_id, &publish_commit)
-    })
-    .await
-    .map_err(|error| format!("join published commit save: {error}"))??;
-    publish_record(app, &published);
-
-    if !git_success(&wiki, &["merge-base", "--is-ancestor", &commit, "@{u}"]).await? {
-        if let Err(error) = git_output(&wiki, &["push"]).await {
-            return block_job(
-                app,
-                workspace,
-                &record.id,
-                &format!("Task commit exists but push failed: {error}"),
-                BlockScope::Job,
-            )
-            .await;
-        }
-    }
-    if !git_success(&wiki, &["merge-base", "--is-ancestor", &commit, "@{u}"]).await? {
-        return block_job(
-            app,
-            workspace,
-            &record.id,
-            "Remote branch does not contain the task commit",
-            BlockScope::Job,
-        )
-        .await;
-    }
-
-    transition(
-        app,
-        workspace,
-        &record.id,
-        JobState::Archiving,
-        "Archiving source PDF",
-        95,
-    )
-    .await?;
-    archive_and_succeed(app, record, workspace, after_processing).await
-}
-
-async fn archive_and_succeed(
-    app: &AppHandle,
-    record: &JobRecord,
-    workspace: &Path,
-    after_processing: &AfterProcessing,
-) -> Result<(), String> {
-    let plan_source = record.source_path.clone();
-    let plan_workspace = workspace.to_path_buf();
-    let plan_job_id = record.id.clone();
-    let plan_behavior = after_processing.clone();
-    let existing_destination = record.archive_destination.clone();
-    let destination = tokio::task::spawn_blocking(move || -> Result<Option<PathBuf>, String> {
-        if let Some(destination) = existing_destination {
-            Ok(Some(destination))
-        } else {
-            planned_archive_destination(&plan_source, &plan_workspace, &plan_job_id, &plan_behavior)
-        }
-    })
-    .await
-    .map_err(|error| format!("join archive planning: {error}"))??;
-    let receipt_workspace = workspace.to_path_buf();
-    let receipt_id = record.id.clone();
-    let receipt_destination = destination.clone();
-    let receipt = tokio::task::spawn_blocking(move || {
-        jobs::set_archive_destination(&receipt_workspace, &receipt_id, receipt_destination)
-    })
-    .await
-    .map_err(|error| format!("join archive receipt save: {error}"))??;
-    publish_record(app, &receipt);
-    let archive_source_path = record.source_path.clone();
-    let archive_input = record.input_path.clone();
-    let archive_behavior = after_processing.clone();
-    let archive_destination = destination.clone();
-    tokio::task::spawn_blocking(move || {
-        archive_source(
-            &archive_source_path,
-            archive_destination.as_deref(),
-            &archive_behavior,
-        )?;
-        if archive_input != archive_source_path
-            && archive_input.exists()
-            && (!matches!(archive_behavior, AfterProcessing::Keep) || archive_source_path.exists())
-        {
-            fs::remove_file(&archive_input)
-                .map_err(|error| format!("remove processing PDF: {error}"))?;
-        }
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|error| format!("join source archival: {error}"))??;
-    transition(
-        app,
-        workspace,
-        &record.id,
-        JobState::Succeeded,
-        "Published",
-        100,
-    )
-    .await?;
-    let deployment_workspace = workspace.to_path_buf();
-    let deployment_id = record.id.clone();
-    let pending = DeploymentSummary {
-        status: "pending".into(),
-        url: None,
-        error: None,
-        updated_at: Some(chrono::Utc::now().to_rfc3339()),
-    };
-    if let Ok(Ok(updated)) = tokio::task::spawn_blocking(move || {
-        jobs::set_deployment(&deployment_workspace, &deployment_id, pending)
-    })
-    .await
-    {
-        publish_record(app, &updated);
-    }
-    append_log(
-        app,
-        "info",
-        &format!("Published {}", record.filename),
-        Some(&record.id),
-    )
-    .await;
-    notify("Added to Cognitio", &record.filename);
-    monitor_deployment(
-        app.clone(),
-        workspace.to_path_buf(),
-        record.id.clone(),
-        receipt.published_commit.clone(),
-    );
-    Ok(())
-}
-
-fn allowed_wiki_path(path: &str) -> bool {
-    path == "references.bib"
-        || ["content/papers/", "content/concepts/", "assets/papers/"]
-            .iter()
-            .any(|prefix| path.starts_with(prefix))
-}
-
-fn monitor_deployment(app: AppHandle, workspace: PathBuf, job_id: String, commit: Option<String>) {
-    tauri::async_runtime::spawn(async move {
-        let Some(commit) = commit else {
-            update_deployment(
-                &app,
-                &workspace,
-                &job_id,
-                "unknown",
-                None,
-                Some("Published commit is unavailable".into()),
-            )
-            .await;
-            return;
-        };
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        for _ in 0..60 {
-            if let Ok(value) = github_run(&workspace.join("wiki"), &commit).await {
-                let status = value.get("status").and_then(serde_json::Value::as_str);
-                let conclusion = value.get("conclusion").and_then(serde_json::Value::as_str);
-                let url = value
-                    .get("url")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-                if status == Some("completed") {
-                    let successful = conclusion == Some("success");
-                    update_deployment(
-                        &app,
-                        &workspace,
-                        &job_id,
-                        if successful { "succeeded" } else { "failed" },
-                        url,
-                        (!successful).then(|| {
-                            format!(
-                                "GitHub Pages concluded with {}",
-                                conclusion.unwrap_or("unknown")
-                            )
-                        }),
-                    )
-                    .await;
-                    if !successful {
-                        notify(
-                            "Cognitio site deployment failed",
-                            "Open the task details for the GitHub Actions run",
-                        );
-                    }
-                    return;
-                }
-                update_deployment(&app, &workspace, &job_id, "running", url, None).await;
-            }
-            tokio::time::sleep(Duration::from_secs(10)).await;
-        }
-        update_deployment(
-            &app,
-            &workspace,
-            &job_id,
-            "unknown",
-            None,
-            Some("GitHub Pages status was not available within 10 minutes".into()),
-        )
-        .await;
-    });
-}
-
-async fn github_run(wiki: &Path, commit: &str) -> Result<serde_json::Value, String> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(30),
-        Command::new("gh")
-            .args([
-                "run",
-                "list",
-                "--workflow",
-                "deploy.yml",
-                "--commit",
-                commit,
-                "--limit",
-                "1",
-                "--json",
-                "status,conclusion,url",
-            ])
-            .current_dir(wiki)
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await
-    .map_err(|_| "GitHub Actions status timed out".to_string())?
-    .map_err(|error| format!("query GitHub Actions status: {error}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().into());
-    }
-    let values: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("decode GitHub Actions status: {error}"))?;
-    values
-        .into_iter()
-        .next()
-        .ok_or_else(|| "GitHub Pages workflow has not started".into())
-}
-
-async fn update_deployment(
-    app: &AppHandle,
-    workspace: &Path,
-    job_id: &str,
-    status: &str,
-    url: Option<String>,
-    error: Option<String>,
-) {
-    let update_workspace = workspace.to_path_buf();
-    let update_job_id = job_id.to_owned();
-    let deployment = DeploymentSummary {
-        status: status.into(),
-        url,
-        error,
-        updated_at: Some(chrono::Utc::now().to_rfc3339()),
-    };
-    if let Ok(Ok(record)) = tokio::task::spawn_blocking(move || {
-        jobs::set_deployment(&update_workspace, &update_job_id, deployment)
-    })
-    .await
-    {
-        publish_record(app, &record);
-    }
-}
-
-async fn transition(
-    app: &AppHandle,
-    workspace: &Path,
-    id: &str,
-    next: JobState,
-    phase: &str,
-    progress: u8,
-) -> Result<(), String> {
-    let workspace = workspace.to_path_buf();
-    let id = id.to_owned();
-    let phase = phase.to_owned();
-    let record =
-        tokio::task::spawn_blocking(move || jobs::update(&workspace, &id, next, &phase, progress))
-            .await
-            .map_err(|error| format!("join job transition: {error}"))??;
-    publish_record(app, &record);
-    Ok(())
-}
-
-async fn update_phase(
-    app: &AppHandle,
-    workspace: &Path,
-    id: &str,
-    phase: &str,
-    progress: u8,
-) -> Result<(), String> {
-    let workspace = workspace.to_path_buf();
-    let id = id.to_owned();
-    let phase = phase.to_owned();
-    let record =
-        tokio::task::spawn_blocking(move || jobs::update_phase(&workspace, &id, &phase, progress))
-            .await
-            .map_err(|error| format!("join job phase update: {error}"))??;
-    publish_record(app, &record);
-    Ok(())
-}
-
-async fn block_job(
-    app: &AppHandle,
-    workspace: &Path,
-    id: &str,
-    message: &str,
-    scope: BlockScope,
-) -> Result<(), String> {
-    let update_workspace = workspace.to_path_buf();
-    let update_id = id.to_owned();
-    let update_message = message.to_owned();
-    let record = tokio::task::spawn_blocking(move || {
-        jobs::block(&update_workspace, &update_id, &update_message, scope)
-    })
-    .await
-    .map_err(|error| format!("join blocked job save: {error}"))??;
-    publish_record(app, &record);
-    append_log(app, "warn", message, Some(id)).await;
-    Ok(())
-}
-
-fn fail_job(app: &AppHandle, record: &JobRecord, error: &str) {
-    let state = app.state::<AppState>();
-    let Ok(snapshot) = state.snapshot.lock() else {
-        return;
-    };
-    let workspace = PathBuf::from(&snapshot.settings.workspace_root);
-    drop(snapshot);
-    if let Ok(failed) = jobs::fail(&workspace, &record.id, error) {
-        publish_record(app, &failed);
-        let job_dir = workspace.join("processing").join(&record.id);
-        let _ = fs::write(job_dir.join("error.txt"), logging::redact(error));
-    }
-    if let Ok(entry) = logging::append(&state.config_dir, "error", error, Some(&record.id)) {
-        if let Ok(mut snapshot) = state.snapshot.lock() {
-            snapshot.logs.push(entry);
-            trim_snapshot_logs(&mut snapshot);
-        }
-    }
-    notify("Cognitio could not complete this paper", &record.filename);
-}
-
-fn publish_record(app: &AppHandle, record: &JobRecord) {
-    let state = app.state::<AppState>();
-    let Ok(mut snapshot) = state.snapshot.lock() else {
-        return;
-    };
-    let summary = record.into();
-    if let Some(existing) = snapshot.jobs.iter_mut().find(|job| job.id == record.id) {
-        *existing = summary;
-    } else {
-        snapshot.jobs.insert(0, summary);
-    }
-    let current: AppSnapshot = snapshot.clone();
-    drop(snapshot);
-    let _ = app.emit("app-snapshot", current.clone());
-    tray::refresh(app, &current);
-}
-
-async fn append_log(app: &AppHandle, level: &str, message: &str, job_id: Option<&str>) {
-    let state = app.state::<AppState>();
-    let config_dir = state.config_dir.clone();
-    let level = level.to_owned();
-    let message = message.to_owned();
-    let job_id = job_id.map(str::to_owned);
-    if let Ok(Ok(entry)) = tokio::task::spawn_blocking(move || {
-        logging::append(&config_dir, &level, &message, job_id.as_deref())
-    })
-    .await
-    {
-        if let Ok(mut snapshot) = state.snapshot.lock() {
-            snapshot.logs.push(entry);
-            trim_snapshot_logs(&mut snapshot);
-        }
-    }
-}
-
-fn trim_snapshot_logs(snapshot: &mut AppSnapshot) {
-    const MAX_LOGS: usize = 200;
-    if snapshot.logs.len() > MAX_LOGS {
-        snapshot.logs.drain(..snapshot.logs.len() - MAX_LOGS);
-    }
-}
-
-fn is_cancelled(app: &AppHandle, id: &str) -> bool {
-    app.state::<AppState>()
-        .snapshot
-        .lock()
-        .is_ok_and(|snapshot| {
-            snapshot
-                .jobs
-                .iter()
-                .any(|job| job.id == id && job.state == "cancelled")
-        })
-}
-
-async fn command_version(kind: agents::AgentKind) -> Option<String> {
-    tokio::time::timeout(
-        Duration::from_secs(15),
-        Command::new(kind.executable()).arg("--version").output(),
-    )
-    .await
-    .ok()?
-    .ok()
-    .filter(|output| output.status.success())
-    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-fn minimal_environment(kind: agents::AgentKind) -> BTreeMap<String, String> {
-    let mut keys = vec![
-        "PATH",
-        "HOME",
-        "TMPDIR",
-        "LANG",
-        "LC_ALL",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "SSH_AUTH_SOCK",
-    ];
-    match kind {
-        agents::AgentKind::Codex => keys.push("CODEX_HOME"),
-        agents::AgentKind::Claude => keys.push("ANTHROPIC_API_KEY"),
-        agents::AgentKind::Opencode => keys.push("OPENCODE_CONFIG"),
-    }
-    keys.into_iter()
-        .filter_map(|key| std::env::var(key).ok().map(|value| (key.into(), value)))
-        .collect()
-}
-
-async fn git_output(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(5 * 60),
-        Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await
-    .map_err(|_| format!("git {} timed out", args.join(" ")))?
-    .map_err(|error| format!("run git {}: {error}", args.join(" ")))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().into())
-}
-
-async fn git_success(cwd: &Path, args: &[&str]) -> Result<bool, String> {
-    tokio::time::timeout(
-        Duration::from_secs(5 * 60),
-        Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .status(),
-    )
-    .await
-    .map_err(|_| format!("git {} timed out", args.join(" ")))?
-    .map(|status| status.success())
-    .map_err(|error| format!("run git {}: {error}", args.join(" ")))
-}
-
-fn notify(title: &str, body: &str) {
-    let script =
-        "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run";
-    let title = title.to_owned();
-    let body = body.to_owned();
-    tauri::async_runtime::spawn(async move {
-        let _ = Command::new("osascript")
-            .args(["-e", script, &title, &body])
-            .stdin(Stdio::null())
-            .status()
-            .await;
-    });
-}
-
-fn planned_archive_destination(
-    source: &Path,
-    workspace: &Path,
-    job_id: &str,
-    behavior: &AfterProcessing,
-) -> Result<Option<PathBuf>, String> {
-    if matches!(behavior, AfterProcessing::Keep) {
-        return Ok(None);
-    }
-    let filename = source
-        .file_name()
-        .ok_or_else(|| "source PDF has no filename".to_string())?;
-    let destination_root = match behavior {
-        AfterProcessing::MoveToDone => workspace.join("done"),
-        AfterProcessing::Trash => {
-            PathBuf::from(std::env::var("HOME").map_err(|_| "HOME is unavailable".to_string())?)
-                .join(".Trash")
-        }
-        AfterProcessing::Keep => unreachable!(),
-    };
-    fs::create_dir_all(&destination_root)
-        .map_err(|error| format!("create archive directory: {error}"))?;
-    let mut destination = destination_root.join(filename);
-    if destination.exists() {
-        destination = destination_root.join(format!("{job_id}-{}", filename.to_string_lossy()));
-    }
-    Ok(Some(destination))
-}
-
-fn archive_source(
-    source: &Path,
-    destination: Option<&Path>,
-    behavior: &AfterProcessing,
-) -> Result<(), String> {
-    if matches!(behavior, AfterProcessing::Keep) {
         return Ok(());
     }
-    let destination =
-        destination.ok_or_else(|| "archive destination is unavailable".to_string())?;
-    if !source.exists() {
-        return if destination.exists() {
+    // Publication is non-cancellable once accepted; persist this boundary before creating a commit.
+    run.apply(JobEvent::Advance(JobStage::Publishing)).await?;
+    publication::commit_agent_changes(&wiki, &record.id, &baseline).await?;
+    let current = load_current(run).await?;
+    let outcome = publication::verify(&current, workspace, Some(&baseline)).await?;
+    drop(guard);
+    finish_publication(run, outcome).await
+}
+
+async fn finish_publication(run: &Execution, outcome: PublicationOutcome) -> Result<(), String> {
+    match outcome {
+        PublicationOutcome::Published(record) => {
+            run.publish(&record);
+            archive_and_succeed(run, &record).await
+        }
+        PublicationOutcome::Blocked(record) => {
+            run.publish(&record);
+            run.log(
+                "warn",
+                record.error.as_deref().unwrap_or("Publication blocked"),
+            );
             Ok(())
-        } else {
-            Err("source PDF and planned archive destination are both missing".into())
-        };
-    }
-    match fs::rename(source, destination) {
-        Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(18) => {
-            let mut input = fs::File::open(source)
-                .map_err(|copy_error| format!("open source PDF for archival: {copy_error}"))?;
-            let temporary = destination.with_extension("cognitio-copying");
-            let mut output = fs::File::create(&temporary)
-                .map_err(|copy_error| format!("create archive PDF: {copy_error}"))?;
-            std::io::copy(&mut input, &mut output)
-                .map_err(|copy_error| format!("copy source PDF to archive: {copy_error}"))?;
-            output
-                .sync_all()
-                .map_err(|copy_error| format!("sync archived PDF: {copy_error}"))?;
-            fs::rename(&temporary, destination)
-                .map_err(|copy_error| format!("finish archived PDF: {copy_error}"))?;
-            fs::remove_file(source)
-                .map_err(|copy_error| format!("remove archived source PDF: {copy_error}"))
         }
-        Err(error) => Err(format!("archive source PDF: {error}")),
     }
+}
+
+async fn archive_and_succeed(run: &Execution, record: &JobRecord) -> Result<(), String> {
+    let settings = record
+        .execution
+        .as_ref()
+        .ok_or("job has no captured execution settings")?;
+    let completed = archive::complete(&run.workspace, record, &settings.after_processing).await?;
+    run.publish(&completed);
+    run.log("info", &format!("Published {}", record.filename));
+    Ok(())
+}
+
+async fn block(
+    run: &Execution,
+    reason: BlockReason,
+    scope: BlockScope,
+    message: &str,
+) -> Result<(), String> {
+    run.apply(JobEvent::Blocked {
+        reason,
+        scope,
+        message: message.into(),
+    })
+    .await?;
+    run.log("warn", message);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn agent_timeout_distinguishes_total_and_idle_limits() {
-        assert!(agent_timeout_error(
-            AGENT_TOTAL_TIMEOUT - Duration::from_secs(1),
-            AGENT_IDLE_TIMEOUT - Duration::from_secs(1)
+    #[tokio::test]
+    async fn cancelling_before_generation_does_not_wait_for_another_jobs_repository_lock() {
+        let root =
+            std::env::temp_dir().join(format!("cognitio-cancel-wait-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("inbox")).unwrap();
+        let source = root.join("inbox/paper.pdf");
+        std::fs::write(&source, b"PDF").unwrap();
+        let job = jobs::create(&root, &source, &crate::models::AppSettings::default()).unwrap();
+        let runtime = JobRuntime::default();
+        let run = runtime.claim(&root, &job.id).unwrap();
+        run.apply(JobEvent::Advance(JobStage::Preflight))
+            .await
+            .unwrap();
+        run.apply(JobEvent::Advance(JobStage::Parsing))
+            .await
+            .unwrap();
+        run.apply(JobEvent::Advance(JobStage::WaitingForWiki))
+            .await
+            .unwrap();
+        let _guard = runtime.repository.lock().await;
+        runtime.cancel(&root, &job.id).unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            reconcile_interruption(&runtime, &run, true)
         )
-        .is_none());
+        .await
+        .unwrap()
+        .unwrap());
         assert_eq!(
-            agent_timeout_error(AGENT_TOTAL_TIMEOUT, Duration::ZERO).as_deref(),
-            Some("agent timed out after 60 minutes")
+            runtime.finish(&run, None).unwrap().state,
+            JobState::Cancelled
         );
-        assert_eq!(
-            agent_timeout_error(Duration::ZERO, AGENT_IDLE_TIMEOUT).as_deref(),
-            Some("agent produced no output for 10 minutes")
-        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    struct FakeAdapters {
+        parses: std::sync::atomic::AtomicUsize,
+        generations: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PipelineAdapters for FakeAdapters {
+        async fn detect(&self) -> Result<Vec<crate::models::ToolCapability>, String> {
+            Ok(vec![crate::models::ToolCapability {
+                id: "codex".into(),
+                detected: true,
+                version: Some("0.146.0".into()),
+                authenticated: None,
+                detail: None,
+            }])
+        }
+        async fn parse(&self, _run: &Execution, output: &Path) -> Result<Option<PathBuf>, String> {
+            self.parses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::fs::create_dir_all(output).await.unwrap();
+            let markdown = output.join("full.md");
+            tokio::fs::write(&markdown, "# Parsed paper\n")
+                .await
+                .unwrap();
+            Ok(Some(markdown))
+        }
+        async fn generate(
+            &self,
+            _run: &Execution,
+            _agent: agents::AgentKind,
+            _version: &str,
+            wiki: &Path,
+            _markdown: &Path,
+        ) -> Result<AgentOutcome, String> {
+            self.generations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::fs::create_dir_all(wiki.join("content/papers"))
+                .await
+                .unwrap();
+            tokio::fs::write(wiki.join("content/papers/paper.md"), "# Paper\n")
+                .await
+                .unwrap();
+            Ok(AgentOutcome::Completed)
+        }
     }
 
     #[tokio::test]
-    async fn reuses_only_verified_task_markdown() {
-        let root = std::env::temp_dir().join(format!(
-            "cognitio-markdown-reuse-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+    async fn pipeline_retry_resumes_publication_without_repeating_parser_or_agent() {
+        let root = std::env::temp_dir().join(format!("cognitio-pipeline-{}", uuid::Uuid::new_v4()));
         let workspace = root.join("workspace");
-        for directory in ["inbox", "processing"] {
-            tokio::fs::create_dir_all(workspace.join(directory))
-                .await
-                .expect("workspace directory");
-        }
-        let source = workspace.join("inbox/paper.pdf");
-        tokio::fs::write(&source, b"%PDF-1.4\n")
-            .await
-            .expect("source PDF");
-        let record =
-            jobs::create(&workspace, &source, &crate::models::AppSettings::default()).expect("job");
-        let output = workspace.join("processing").join(&record.id).join("parsed");
-        tokio::fs::create_dir_all(&output)
-            .await
-            .expect("parse output directory");
-        let markdown = output.join("full.md");
-
-        tokio::fs::write(&markdown, b"# Paper\n")
-            .await
-            .expect("parsed markdown");
-        assert_eq!(
-            reusable_markdown(&output, &record, &crate::models::MineruMode::Precision).await,
-            None
-        );
-
-        let manifest = ParseManifest {
-            schema_version: 1,
-            source_sha256: record.sha256.clone(),
-            mode: "flash".into(),
-            profile_version: mineru::PROFILE_VERSION.into(),
-            markdown_sha256: jobs::sha256(&markdown).expect("checksum"),
-            markdown_size: 8,
-            completed_at: chrono::Utc::now().to_rfc3339(),
+        let wiki = workspace.join("wiki");
+        let remote = root.join("remote.git");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::create_dir_all(workspace.join("inbox")).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         };
-        tokio::fs::write(
-            output.join("manifest.json"),
-            serde_json::to_vec(&manifest).expect("manifest"),
-        )
-        .await
-        .expect("write manifest");
+        git(&root, &["init", "--bare", remote.to_str().unwrap()]);
+        git(&wiki, &["init", "--initial-branch", "main"]);
+        git(&wiki, &["config", "user.name", "Cognitio Test"]);
+        git(&wiki, &["config", "user.email", "test@cognitio.local"]);
+        std::fs::write(wiki.join("README.md"), "base\n").unwrap();
+        git(&wiki, &["add", "."]);
+        git(&wiki, &["commit", "-m", "Base"]);
+        git(
+            &wiki,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&wiki, &["push", "-u", "origin", "main"]);
+        git(
+            &wiki,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                root.join("missing.git").to_str().unwrap(),
+            ],
+        );
+        let source = workspace.join("inbox/paper.pdf");
+        std::fs::write(&source, b"%PDF-1.4\n").unwrap();
+        let settings = crate::models::AppSettings::default();
+        let job = jobs::create(&workspace, &source, &settings).unwrap();
+        let runtime = JobRuntime::default();
+        let adapters = FakeAdapters {
+            parses: 0.into(),
+            generations: 0.into(),
+        };
+        let first = runtime.claim(&workspace, &job.id).unwrap();
+        run_pipeline_with(&runtime, &first, &adapters)
+            .await
+            .unwrap();
+        let blocked = runtime.finish(&first, None).unwrap();
+        assert_eq!(blocked.state, JobState::Blocked);
+        assert!(source.is_file());
+        assert!(job.input_path.is_file());
+        git(
+            &wiki,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                remote.to_str().unwrap(),
+            ],
+        );
+        runtime
+            .retry(&workspace, &job.id, &settings, false)
+            .await
+            .unwrap();
+        let second = runtime.claim(&workspace, &job.id).unwrap();
+        run_pipeline_with(&runtime, &second, &adapters)
+            .await
+            .unwrap();
+        let completed = runtime.finish(&second, None).unwrap();
+        assert_eq!(completed.state, JobState::Succeeded);
+        assert_eq!(completed.task_commit, blocked.task_commit);
+        assert!(completed.remote_confirmed);
+        assert_eq!(completed.deployment.status, "pending");
+        assert!(!source.exists());
+        assert!(workspace.join("done/paper.pdf").is_file());
+        assert_eq!(adapters.parses.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
-            reusable_markdown(&output, &record, &crate::models::MineruMode::Precision).await,
-            None
+            adapters
+                .generations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_work_is_scheduled_before_new_jobs() {
+        let record = |id: &str, state: JobState, updated_at: &str| JobRecord {
+            schema_version: 2,
+            id: id.into(),
+            filename: format!("{id}.pdf"),
+            source_path: format!("inbox/{id}.pdf").into(),
+            input_path: format!("processing/{id}/{id}.pdf").into(),
+            sha256: id.into(),
+            state,
+            phase: "test".into(),
+            progress: 0,
+            agent: None,
+            created_at: updated_at.into(),
+            updated_at: updated_at.into(),
+            error: None,
+            base_commit: None,
+            task_commit: None,
+            execution: None,
+            force_reparse: false,
+            block_scope: None,
+            archive_destination: None,
+            deployment: DeploymentSummary::default(),
+            revision: 0,
+            active_run: None,
+            stage: crate::jobs::JobStage::Queued,
+            block_reason: None,
+            remote_confirmed: false,
+        };
+        let records = vec![
+            record("queued", JobState::Queued, "2026-01-03T00:00:00Z"),
+            record("verifying", JobState::Verifying, "2026-01-02T00:00:00Z"),
+            record("archiving", JobState::Archiving, "2026-01-01T00:00:00Z"),
+        ];
+
+        assert_eq!(MAX_CONCURRENT_JOBS, 3);
+        assert_eq!(
+            select_next_job(records.clone(), &BTreeSet::new())
+                .expect("next job")
+                .id,
+            "archiving"
         );
         assert_eq!(
-            reusable_markdown(&output, &record, &crate::models::MineruMode::Flash).await,
-            Some(markdown)
+            select_next_job(records, &BTreeSet::from(["archiving".into()]))
+                .expect("next non-active job")
+                .id,
+            "verifying"
         );
-        tokio::fs::remove_dir_all(root).await.expect("cleanup");
     }
 }

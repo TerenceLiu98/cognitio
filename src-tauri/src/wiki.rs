@@ -1,12 +1,20 @@
 use std::{fs, io::Cursor, path::Path, process::Stdio, time::Duration};
 
 use sha2::{Digest, Sha256};
-use tokio::{process::Command, sync::watch};
+use tokio::sync::watch;
 
-use crate::models::RepositoryVisibility;
+use crate::{models::RepositoryVisibility, tools};
 
 pub const QUARTZ_COMMIT: &str = "9cf87ff1c248a8ca551093214b0fec3b31415009";
 const TEMPLATE_BYTES: &[u8] = include_bytes!("../resources/quartz-template.zip");
+const DESIGN_VERSION: u32 = 2;
+const QUARTZ_OVERRIDE: &str = include_str!("../resources/quartz-overrides/quartz.ts");
+const STYLE_OVERRIDE: &str = include_str!("../resources/quartz-overrides/custom.scss");
+const RECENT_NOTES_DISABLED: &str =
+    "  - source: github:quartz-community/recent-notes\n    enabled: false\n";
+const RECENT_NOTES_ENABLED: &str = "  - source: github:quartz-community/recent-notes\n    enabled: true\n    layout:\n      position: afterBody\n      priority: 10\n      condition: index-only\n";
+const BACKLINKS_DEFAULT: &str = "  - source: github:quartz-community/backlinks\n    enabled: true\n    layout:\n      position: right\n      priority: 50\n";
+const BACKLINKS_NON_INDEX: &str = "  - source: github:quartz-community/backlinks\n    enabled: true\n    layout:\n      position: right\n      priority: 50\n      condition: not-index\n";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub async fn install_template(
@@ -130,11 +138,21 @@ fn write_overlay(wiki: &Path, slug: &str, site_title: &str) -> Result<(), String
         .map_err(|error| format!("write Wiki homepage: {error}"))?;
     fs::write(wiki.join("references.bib"), "")
         .map_err(|error| format!("write bibliography: {error}"))?;
+    fs::write(wiki.join("quartz.ts"), QUARTZ_OVERRIDE)
+        .map_err(|error| format!("write managed Quartz configuration: {error}"))?;
+    fs::write(wiki.join("quartz/styles/custom.scss"), STYLE_OVERRIDE)
+        .map_err(|error| format!("write managed Quartz styles: {error}"))?;
+    let mut design_digest = Sha256::new();
+    design_digest.update(QUARTZ_OVERRIDE.as_bytes());
+    design_digest.update([0]);
+    design_digest.update(STYLE_OVERRIDE.as_bytes());
     fs::write(
         wiki.join(".llmwiki-template.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "quartzCommit": QUARTZ_COMMIT,
             "sha256": format!("{:x}", Sha256::digest(TEMPLATE_BYTES)),
+            "designVersion": DESIGN_VERSION,
+            "designSha256": format!("{:x}", design_digest.finalize()),
             "templateInstalled": true
         }))
         .map_err(|error| format!("serialize template marker: {error}"))?,
@@ -175,6 +193,15 @@ fn configure_site(wiki: &Path, slug: &str, site_title: &str) -> Result<(), Strin
     };
     replace_yaml_scalar(&mut contents, "baseUrl", &base_url, false)?;
     replace_yaml_scalar(&mut contents, "pageTitle", site_title, true)?;
+    replace_yaml_scalar(&mut contents, "defaultDateType", "created", false)?;
+    if !contents.contains(RECENT_NOTES_DISABLED) {
+        return Err("Quartz configuration has no disabled recent-notes plugin".into());
+    }
+    contents = contents.replacen(RECENT_NOTES_DISABLED, RECENT_NOTES_ENABLED, 1);
+    if !contents.contains(BACKLINKS_DEFAULT) {
+        return Err("Quartz configuration has no default backlinks layout".into());
+    }
+    contents = contents.replacen(BACKLINKS_DEFAULT, BACKLINKS_NON_INDEX, 1);
     fs::write(path, contents).map_err(|error| format!("configure Quartz site: {error}"))
 }
 
@@ -222,7 +249,7 @@ fn homepage(site_title: &str) -> Result<String, String> {
     let yaml_title = serde_json::to_string(site_title)
         .map_err(|error| format!("encode homepage title: {error}"))?;
     Ok(format!(
-        "---\ntitle: {yaml_title}\n---\n\n# {site_title}\n\nA connected library of papers and concepts.\n"
+        "---\ntitle: {yaml_title}\n---\n\nA connected library of papers and concepts.\n"
     ))
 }
 
@@ -551,7 +578,7 @@ async fn command_output(
     if *cancel.borrow() {
         return Err("initialization cancelled".into());
     }
-    let child = Command::new(executable)
+    let child = tools::tokio_command(executable)?
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -697,9 +724,31 @@ mod tests {
         let config = fs::read_to_string(root.join("wiki/quartz.config.yaml")).expect("config");
         assert!(config.contains("baseUrl: owner.github.io/research"));
         assert!(config.contains("pageTitle: \"Research: \\\"Notes\\\"\""));
+        assert!(config.contains("defaultDateType: created"));
+        assert!(config.contains("condition: index-only"));
+        assert!(config.contains("priority: 50\n      condition: not-index"));
         let homepage = fs::read_to_string(root.join("wiki/content/index.md")).expect("homepage");
         assert!(homepage.contains("title: \"Research: \\\"Notes\\\"\""));
+        assert!(!homepage.contains("# Research:"));
         assert!(!homepage.contains("LLMWiki"));
+        let quartz = fs::read_to_string(root.join("wiki/quartz.ts")).expect("Quartz override");
+        assert!(quartz.contains("node.slugSegment !== \"papers\""));
+        assert!(quartz.contains("node.slugSegment !== \"tags\""));
+        assert!(quartz.contains("registerCondition(\"index-only\""));
+        assert!(quartz.contains("page.slug?.startsWith(\"papers/\")"));
+        let styles = fs::read_to_string(root.join("wiki/quartz/styles/custom.scss"))
+            .expect("style override");
+        assert!(styles.contains("max-width: 1800px"));
+        assert!(styles.contains("minmax(0, 1fr)"));
+        assert!(styles.contains("counter-increment: paper"));
+        let marker: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("wiki/.llmwiki-template.json")).expect("marker"),
+        )
+        .expect("template marker JSON");
+        assert_eq!(marker["designVersion"], DESIGN_VERSION);
+        assert!(marker["designSha256"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
         assert!(!root.join("wiki/node_modules").exists());
         assert!(!legacy.exists());
         assert!(root.join("wiki/content/user-note.md").is_file());
@@ -772,7 +821,8 @@ mod tests {
         let workflow =
             fs::read_to_string(wiki.join(".github/workflows/deploy.yml")).expect("workflow");
         assert!(config.contains("pageTitle: \"研究: \\\"Notes\\\"\""));
-        assert!(homepage.contains("# 研究: \"Notes\""));
+        assert!(homepage.contains("title: \"研究: \\\"Notes\\\"\""));
+        assert!(!homepage.contains("# 研究:"));
         assert!(!homepage.contains("LLMWiki"));
         assert!(!workflow.contains("LLMWiki"));
         assert_eq!(

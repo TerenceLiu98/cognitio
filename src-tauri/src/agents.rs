@@ -3,7 +3,40 @@ use std::{collections::BTreeMap, path::Path};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::models::AgentProvider;
+use crate::models::{AgentProvider, ToolCapability};
+
+pub fn select_supported<'a>(
+    provider: &AgentProvider,
+    capabilities: &'a [ToolCapability],
+) -> Result<(AgentKind, &'a str), String> {
+    let mut failures = Vec::new();
+    for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Opencode] {
+        if !matches!(provider, AgentProvider::Auto)
+            && select(provider, |candidate| candidate == kind).is_err()
+        {
+            continue;
+        }
+        match capabilities.iter().find(|tool| tool.id == kind.as_str()) {
+            Some(tool) if tool.detected => {
+                if let Some(version) = tool.version.as_deref() {
+                    match validate_version(kind, version) {
+                        Ok(()) => return Ok((kind, version)),
+                        Err(error) => failures.push(error),
+                    }
+                } else {
+                    failures.push(format!("{} version is unavailable", kind.as_str()));
+                }
+            }
+            Some(tool) => failures.push(format!(
+                "{}: {}",
+                kind.as_str(),
+                tool.detail.as_deref().unwrap_or("executable was not found")
+            )),
+            None => failures.push(format!("{} was not found", kind.as_str())),
+        }
+    }
+    Err(failures.join("; "))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentKind {
@@ -179,6 +212,31 @@ pub fn parse_event(line: &str) -> NormalizedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_skips_incompatible_agents_before_processing_starts() {
+        let tools = vec![
+            ToolCapability {
+                id: "codex".into(),
+                detected: true,
+                authenticated: None,
+                version: Some("codex-cli 9.0.0".into()),
+                detail: None,
+            },
+            ToolCapability {
+                id: "claude".into(),
+                detected: true,
+                authenticated: None,
+                version: Some("2.1.0".into()),
+                detail: None,
+            },
+        ];
+        assert_eq!(
+            select_supported(&AgentProvider::Auto, &tools).unwrap().0,
+            AgentKind::Claude
+        );
+        assert!(select_supported(&AgentProvider::Codex, &tools).is_err());
+    }
 
     #[test]
     fn command_builders_use_safe_non_interactive_flags() {

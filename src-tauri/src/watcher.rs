@@ -5,9 +5,13 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
-use crate::{commands::AppState, jobs, logging, models::AppSnapshot, tray};
+use crate::{
+    app_events::{append_log_blocking, publish_record},
+    app_state::AppState,
+    jobs,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Fingerprint {
@@ -74,21 +78,30 @@ pub fn start(app: AppHandle) {
 
 fn scan_once(app: &AppHandle, tracker: &mut StabilityTracker) {
     let state = app.state::<AppState>();
-    let (enabled, workspace, settings, mut known_hashes) = match state.snapshot.lock() {
+    let (enabled, workspace, settings) = match state.snapshot.lock() {
         Ok(snapshot) => (
             snapshot.configured && snapshot.watching,
             PathBuf::from(&snapshot.settings.workspace_root),
             snapshot.settings.clone(),
-            jobs::load_all(PathBuf::from(&snapshot.settings.workspace_root).as_path())
-                .into_iter()
-                .map(|job| job.sha256)
-                .collect::<HashSet<_>>(),
         ),
         Err(_) => return,
     };
     if !enabled {
         return;
     }
+    let mut known_hashes = match jobs::load_all(&workspace) {
+        Ok(records) => records
+            .into_iter()
+            .map(|job| job.sha256)
+            .collect::<HashSet<_>>(),
+        Err(error) => {
+            if let Ok(mut snapshot) = state.snapshot.lock() {
+                snapshot.watching = false;
+            }
+            append_log_blocking(app, "error", &error, None);
+            return;
+        }
+    };
 
     let Ok(entries) = fs::read_dir(workspace.join("inbox")) else {
         return;
@@ -114,23 +127,11 @@ fn scan_once(app: &AppHandle, tracker: &mut StabilityTracker) {
                 {
                     Ok(record) => {
                         known_hashes.insert(record.sha256.clone());
-                        if let Ok(entry) =
-                            logging::append(&state.config_dir, "error", message, Some(&record.id))
-                        {
-                            let current = if let Ok(mut snapshot) = state.snapshot.lock() {
-                                snapshot.jobs.insert(0, (&record).into());
-                                snapshot.logs.push(entry);
-                                Some(snapshot.clone())
-                            } else {
-                                None
-                            };
-                            if let Some(current) = current {
-                                publish_snapshot(app, current);
-                            }
-                        }
+                        publish_record(app, &record);
+                        append_log_blocking(app, "error", message, Some(&record.id));
                     }
                     Err(error) => {
-                        let _ = logging::append(&state.config_dir, "error", &error, None);
+                        append_log_blocking(app, "error", &error, None);
                     }
                 }
                 continue;
@@ -146,35 +147,20 @@ fn scan_once(app: &AppHandle, tracker: &mut StabilityTracker) {
         }
         match jobs::create(&workspace, &path, &settings) {
             Ok(record) => {
-                if let Ok(entry) = logging::append(
-                    &state.config_dir,
+                publish_record(app, &record);
+                append_log_blocking(
+                    app,
                     "info",
                     &format!("Queued {}", record.filename),
                     Some(&record.id),
-                ) {
-                    let current = if let Ok(mut snapshot) = state.snapshot.lock() {
-                        snapshot.jobs.insert(0, (&record).into());
-                        snapshot.logs.push(entry);
-                        Some(snapshot.clone())
-                    } else {
-                        None
-                    };
-                    if let Some(current) = current {
-                        publish_snapshot(app, current);
-                    }
-                }
+                );
             }
             Err(error) => {
-                let _ = logging::append(&state.config_dir, "error", &error, None);
+                append_log_blocking(app, "error", &error, None);
             }
         }
     }
     tracker.remove_missing();
-}
-
-fn publish_snapshot(app: &AppHandle, snapshot: AppSnapshot) {
-    let _ = app.emit("app-snapshot", snapshot.clone());
-    tray::refresh(app, &snapshot);
 }
 
 #[cfg(test)]

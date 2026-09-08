@@ -35,7 +35,7 @@ pub fn export(
         }
     }
     let workspace = Path::new(&snapshot.settings.workspace_root);
-    for mut record in jobs::load_all(workspace) {
+    for mut record in jobs::load_all(workspace)? {
         record.source_path = PathBuf::from("inbox").join(&record.filename);
         record.input_path = PathBuf::from("processing")
             .join(&record.id)
@@ -104,6 +104,7 @@ mod tests {
             ..AppSettings::default()
         };
         let snapshot = AppSnapshot {
+            revision: 0,
             ready: true,
             configured: false,
             watching: false,

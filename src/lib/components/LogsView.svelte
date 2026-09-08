@@ -75,16 +75,16 @@
     min-height: 240px;
     place-content: center;
     justify-items: center;
-    margin-top: 30px;
-    border: 1px dashed var(--border-strong);
-    border-radius: 6px;
+    margin-top: 22px;
+    border-radius: 8px;
     color: var(--muted);
+    background: #f6f7f5;
   }
   .log-list {
-    margin-top: 30px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--surface);
+    overflow: hidden;
+    margin-top: 22px;
+    border-radius: 8px;
+    background: #f6f7f5;
   }
   article {
     display: grid;

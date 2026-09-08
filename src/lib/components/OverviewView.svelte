@@ -9,6 +9,12 @@
   } from "@lucide/svelte";
 
   import type { Translator } from "$lib/i18n";
+  import {
+    activeStates,
+    countJobs,
+    jobPhase,
+    processingJobs,
+  } from "$lib/job-presentation";
   import type { AppSnapshot, JobState, RetryMode } from "$lib/types";
 
   let {
@@ -25,17 +31,9 @@
     onCancel: (id: string) => void;
   } = $props();
 
-  const activeStates: JobState[] = [
-    "stabilizing",
-    "queued",
-    "preflight",
-    "running",
-    "verifying",
-    "archiving",
-  ];
-
+  let activeJobs = $derived(processingJobs(snapshot.jobs));
   function count(states: JobState[]): number {
-    return snapshot.jobs.filter((job) => states.includes(job.state)).length;
+    return countJobs(snapshot.jobs, states);
   }
 
   function dateLabel(value: string): string {
@@ -86,6 +84,36 @@
     </div>
   </div>
 
+  {#if activeJobs.length > 0}
+    <div
+      class="active-papers"
+      aria-label={`${t("currentActivity")} (${activeJobs.length})`}
+    >
+      {#each activeJobs as activeJob, index (activeJob.id)}
+        <section
+          class="active-paper"
+          aria-labelledby={`active-paper-title-${index}`}
+        >
+          <div class="active-paper-heading">
+            <div>
+              <span>{t("currentActivity")}</span>
+              <h2 id={`active-paper-title-${index}`}>{activeJob.filename}</h2>
+              <p>{jobPhase(activeJob, snapshot.settings.locale)}</p>
+            </div>
+            <strong>{activeJob.progress}%</strong>
+          </div>
+          <div class="active-progress" aria-label={`${activeJob.progress}%`}>
+            <span style={`width: ${activeJob.progress}%`}></span>
+          </div>
+          <div class="active-meta">
+            <span>{activeJob.state}</span>
+            <span>{activeJob.agent ?? t("agentDefault")}</span>
+          </div>
+        </section>
+      {/each}
+    </div>
+  {/if}
+
   <div class="metrics" aria-label={t("currentActivity")}>
     <div><span>{t("queued")}</span><strong>{count(activeStates)}</strong></div>
     <div>
@@ -121,7 +149,8 @@
           <div class="filename">
             <FileText size={16} />
             <div>
-              <span>{job.filename}</span><small>{job.phase}</small
+              <span>{job.filename}</span><small
+                >{jobPhase(job, snapshot.settings.locale)}</small
               >{#if job.error}<details>
                   <summary>{t("details")}</summary>
                   <p>{job.error}</p>
@@ -190,15 +219,85 @@
 </section>
 
 <style>
+  .active-papers {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 24px;
+  }
+  .active-paper {
+    min-width: 0;
+    border-radius: 8px;
+    padding: 16px;
+    background: #f5f6f4;
+  }
+  .active-paper-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 20px;
+  }
+  .active-paper-heading > div {
+    min-width: 0;
+  }
+  .active-paper-heading > div > span {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 620;
+    text-transform: uppercase;
+  }
+  .active-paper h2 {
+    overflow: hidden;
+    margin: 5px 0 0;
+    font-size: 14px;
+    font-weight: 640;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .active-paper p {
+    overflow: hidden;
+    margin: 4px 0 0;
+    color: var(--muted);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .active-paper-heading > strong {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 560;
+    font-variant-numeric: tabular-nums;
+  }
+  .active-progress {
+    height: 7px;
+    overflow: hidden;
+    margin-top: 14px;
+    border-radius: 4px;
+    background: #dfe1de;
+  }
+  .active-progress span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--positive);
+  }
+  .active-meta {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 7px;
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: capitalize;
+  }
   .metrics {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
-    margin: 26px 0 34px;
+    margin: 20px 0 28px;
     border-block: 1px solid var(--border);
   }
   .metrics div {
     display: flex;
-    min-height: 92px;
+    min-height: 68px;
     flex-direction: column;
     justify-content: center;
     padding: 14px 20px;
@@ -213,7 +312,7 @@
   }
   .metrics strong {
     margin-top: 4px;
-    font-size: 28px;
+    font-size: 22px;
     font-weight: 620;
   }
   .quick-actions {
@@ -230,7 +329,7 @@
   }
   .table-heading h2 {
     margin: 0;
-    font-size: 15px;
+    font-size: 13px;
   }
   .table-heading span {
     color: var(--muted);
@@ -251,9 +350,8 @@
   }
   .job-list {
     overflow: hidden;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--surface);
+    border-radius: 8px;
+    background: #f7f8f6;
   }
   .job-header,
   .job-row {
@@ -267,7 +365,7 @@
   .job-header {
     padding: 9px 14px;
     color: var(--muted);
-    background: var(--surface-subtle);
+    background: transparent;
     font-size: 11px;
   }
   .job-row {
@@ -353,7 +451,7 @@
   .progress span {
     display: block;
     height: 100%;
-    background: var(--accent);
+    background: var(--positive);
   }
   time {
     color: var(--muted);
@@ -365,6 +463,9 @@
     gap: 2px;
   }
   @media (max-width: 880px) {
+    .active-papers {
+      grid-template-columns: 1fr;
+    }
     .job-header {
       display: none;
     }

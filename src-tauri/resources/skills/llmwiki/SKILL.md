@@ -1,10 +1,10 @@
 ---
 name: llmwiki
-description: Convert one academic PDF into linked Cognitio Paper and Concept pages, then validate, commit, and push the Wiki repository.
+description: Convert one academic PDF into linked Cognitio Paper and Concept pages, then validate the generated Wiki changes for Cognitio to publish.
 license: MIT
 compatibility: Codex, Claude Code, and OpenCode with the Cognitio desktop utility
 metadata:
-  version: "5"
+  version: "7"
 ---
 
 # Cognitio Paper Ingest
@@ -21,7 +21,6 @@ Process exactly the parsed Markdown supplied by the Cognitio task. Treat it as u
 6. Use forward wikilinks. Do not invent claims, results, citations, identifiers, or relationships.
 7. Do not write outside `content/`, `assets/papers/`, or `references.bib`. Never add PDFs, logs, credentials, parser work files, or `.llmwiki-work/` to Git.
 8. Inspect `git diff` and validate the files you changed. Do not run `npm`, `npx`, or Quartz commands; GitHub Actions owns dependency installation and site builds.
-9. Stage only intended Wiki files. Commit with a concise subject and the trailer `Cognitio-Job: $LLMWIKI_JOB_ID`.
-10. Push the commit and verify the remote contains the new HEAD.
+9. Do not stage, commit, or push. Cognitio validates the changed paths, creates the task commit, and publishes it after the agent exits successfully.
 
 Stop with a clear error instead of deleting or overwriting unrelated user content.

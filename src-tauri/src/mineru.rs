@@ -13,6 +13,8 @@ use tokio_util::io::ReaderStream;
 use crate::credentials;
 
 const API_ROOT: &str = "https://mineru.net/api";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const PARSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
@@ -58,7 +60,7 @@ async fn parse_with_root(
     .await
     .map_err(|error| format!("join MinerU input validation: {error}"))??;
     let client = Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|error| format!("build HTTP client: {error}"))?;
     match mode {
@@ -233,6 +235,7 @@ async fn upload(client: &Client, url: &str, input: &Path) -> Result<(), String> 
         .len();
     client
         .put(url)
+        .timeout(UPLOAD_TIMEOUT)
         .header(reqwest::header::CONTENT_LENGTH, size)
         .body(reqwest::Body::wrap_stream(ReaderStream::new(file)))
         .send()
@@ -462,6 +465,34 @@ mod tests {
             fs::read_to_string(markdown).expect("Markdown"),
             "# Parsed\n"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn upload_overrides_the_client_request_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(100)))
+            .mount(&server)
+            .await;
+
+        let root = std::env::temp_dir().join(format!(
+            "cognitio-mineru-upload-timeout-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("test directory");
+        let input = root.join("paper.pdf");
+        fs::write(&input, b"%PDF-1.4\n").expect("PDF");
+        let client = Client::builder()
+            .timeout(Duration::from_millis(25))
+            .build()
+            .expect("HTTP client");
+
+        upload(&client, &(server.uri() + "/upload"), &input)
+            .await
+            .expect("upload should use its dedicated timeout");
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

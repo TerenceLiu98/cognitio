@@ -5,7 +5,7 @@
 - 目标是交付 macOS 优先、Apple Silicon 的开发者预览版。
 - 技术栈固定为 Tauri 2、Rust/Tokio、Svelte/TypeScript；App 使用 `pnpm`，Quartz 5 保留上游 `npm`/`package-lock.json`。
 - UI 提供中英双语，默认跟随系统语言并允许手动切换。
-- App 负责工作区、监听、串行队列、状态恢复、MinerU 解析和 Agent 启动；单一 `$llmwiki` Skill 只读取 App 生成的本地 Markdown，负责知识写入、校验、commit 和 push。
+- App 负责工作区、监听、有界并行队列、状态恢复、MinerU 解析、Agent 启动以及 Git 发布；单一 `$llmwiki` Skill 只读取 App 生成的本地 Markdown，负责知识写入和内容校验。
 - 首先用 Codex 打通完整垂直链路，再实现 Claude Code 和 OpenCode；不加入数据库、MCP、ACP、遥测、签名、公证或自动更新。
 
 ## 核心流程与架构
@@ -14,11 +14,11 @@
 - 首次设置依次完成：语言、工作区、工具检测、Agent/模型、MinerU 模式、GitHub 仓库、Skill 安装和端到端预检；发布固定使用 GitHub Actions Pages。
 - App 配置以带 `schemaVersion` 的 JSON 原子写入 macOS Application Support；MinerU Token 只进入 Keychain。初始化使用原子 journal 记录阶段，重启后将运行中任务标记为可重试的中断状态。
 - PDF 经“大小和修改时间连续 3 次、每次间隔 2 秒不变”后入队；稳定超时为 5 分钟。以 SHA-256 防止重复处理，重复文件默认跳过并提供“重新处理”。
-- 同一 Wiki 只运行一个任务。状态机固定为 `Detected -> Stabilizing -> Queued -> Preflight -> Running -> Verifying -> Archiving -> Succeeded`，异常进入 `Blocked`、`Failed` 或 `Cancelled`；合法操作由后端随任务摘要返回。
-- 每个任务使用 `processing/<job-id>/` 保存原始 PDF、版本化 `job.json` 和日志，并在 `wiki/.llmwiki-work/<job-id>/` 建立被 Git 忽略的 Agent 工作区。
+- Worker 最多同时推进 3 个任务；MinerU 在各自的任务目录中并行解析，但同一 Wiki 只允许一个任务运行 Agent、commit 和 push。持久化流程为 `Queued -> Preflight -> Running -> Verifying -> Archiving -> Succeeded`；稳定文件检测在入队前完成，异常进入 `Blocked` 或 `Failed`，运行中的取消经 `Cancelling -> Cancelled` 确认。合法操作由后端随任务摘要返回。
+- 每个任务使用 `processing/<job-id>/` 保存原始 PDF、版本化 `job.json` 和 `parsed/manifest.json`；Agent 在 Wiki 中生成内容，解析输入保留在任务目录中。schema 3 记录类型化阶段、阻塞原因、执行身份、修订号、任务提交、远端确认和归档目的地。
 - 成功后按设置执行 Keep、Move to Done 或移入 macOS Trash；失败和取消均保留 PDF、解析产物和诊断日志，不永久删除。
 - 启动时恢复未完成任务：未产生改动则重新排队；存在未提交修改则阻塞后续队列并等待 Retry；已有提交但未推送时只恢复校验与 push，不重复分析。
-- App 在记录任务基线前要求 Git 工作区干净并执行 `git pull --ff-only`。Skill 只负责内容校验、commit、push；Quartz 依赖安装和站点构建仅由 GitHub Actions 执行。提交包含 `Cognitio-Job: <uuid>` trailer，用于幂等恢复。
+- App 在记录任务基线前要求 Git 工作区干净并执行 `git pull --ff-only`。Skill 只负责生成和校验内容；App 拒绝删除、重命名和白名单外的变更，再负责 commit、push。Quartz 依赖安装和站点构建仅由 GitHub Actions 执行。提交包含 `Cognitio-Job: <uuid>` trailer，用于幂等恢复。
 - 成功判定要求基线后恰好一个任务提交、精确 trailer、允许的变更路径、干净工作区和远端包含该 commit。已 commit 但 push 失败时只恢复 push，不重复分析。
 
 ## 接口与安全边界
@@ -30,7 +30,7 @@
 - Adapter 根据 CLI 版本生成参数，未知主版本 fail closed。禁止使用跳过 sandbox/permissions 的危险参数；只授予 Wiki 和任务暂存区所需权限。
 - App 仅向 Agent 传递最小环境变量集合，包括 `PATH`、`HOME`、临时目录、标准代理变量、任务 ID 和已解析 Markdown 路径；MinerU Token 不进入 Agent、prompt 或日志。
 - App 在启动 Agent 前异步调用 MinerU。只有 PDF 哈希、解析模式、profile 版本、Markdown 大小和 checksum 与 `parsed/manifest.json` 全部匹配时才复用结果；Retry 另提供强制重新解析。隐藏 CLI `llmwiki parse --input ... --output ... --mode ... --json` 仅用于诊断，不由 Skill 调用。
-- Skill 将 PDF 内容视为不可信数据，明确忽略论文内的操作指令；只允许写入 Wiki 约定目录，不提交 `.llmwiki-work/`、PDF、凭据或日志。
+- Skill 将 PDF 内容视为不可信数据，明确忽略论文内的操作指令；只允许写入 Wiki 约定目录，不执行 Git 写操作。App 仅提交白名单中的 Paper、Concept、论文资源和参考文献变更，绝不提交 `.llmwiki-work/`、PDF、凭据或日志。
 - Skill 以版本化资源安装到 Codex、Claude Code、OpenCode 各自支持的用户 Skill 目录；更新时校验旧版本 checksum，用户修改过的副本绝不自动覆盖。
 
 ## 仓库与网站
@@ -48,7 +48,7 @@
 1. **M0 工程基线**：建立 Tauri/Svelte/Rust 脚手架、双语消息目录、格式化/lint/test/build 脚本和 CI；所有空壳检查通过。
 2. **M1 App 基础**：完成菜单栏、设置窗口、Application Support 配置、Keychain、日志、通知、登录启动和工作区初始化。
 3. **M2 Wiki 初始化**：完成 Quartz 5 固定模板打包、异步 Git/`gh` 接入、private 默认策略、GitHub Actions Pages 配置和可取消初始化。
-4. **M3 任务引擎**：完成文件稳定检测、SHA 去重、串行队列、状态持久化、暂停、取消、重启恢复和三种归档策略。
+4. **M3 任务引擎**：完成文件稳定检测、SHA 去重、三槽流水线、单 Wiki 发布锁、状态持久化、暂停、取消、重启恢复和三种归档策略。
 5. **M4 Codex 垂直切片**：完成 MinerU CLI、`$llmwiki` Skill、CodexRunner、结构化事件、Git 发布和首篇论文端到端验收。
 6. **M5 多 Agent**：在同一契约下加入 ClaudeRunner、OpenCodeRunner、版本能力矩阵、模型覆盖和认证诊断。
 7. **M6 失败恢复与体验**：完成阶段化 Retry、脏仓库阻塞、push 恢复、失败诊断包、双语空态/错误态和系统通知。
@@ -65,12 +65,26 @@
 
 ## 测试与验收
 
+- 修复运行中任务遇到未提交 Wiki 修改时的 `Running -> Blocked` 转换；回归测试覆盖 Agent 启动前及异常退出后的阻塞原因、仓库阻塞范围持久化和 Retry。
 - Rust 单元测试覆盖状态迁移、文件稳定、去重、路径安全、配置迁移、参数生成、事件归一化、日志脱敏和恢复决策。
 - 使用 mock MinerU HTTP、本地 Agent 事件 fixtures 和 bare Git remote 做离线集成测试；CI 不调用真实模型或外部付费服务。
 - UI 使用 Vitest 组件测试和 Chromium Playwright，覆盖后端允许操作、Blocked/Retry、设置只读仓库、错误详情和部署状态。
 - Rust 测试重点覆盖 trailer 归属、无关提交、解析缓存模式、ZIP 边界、Agent 超时、脏仓库和重启恢复；外部服务失败仍由发布前真实 smoke test 补充。
 - Codex、Claude、OpenCode 各保留一套人工真实凭据 smoke test；发布前分别处理同一组小型学术 PDF，并检查 Markdown、概念复用、Git 历史和站点页面。
 - v0.1 不设置全仓库数字覆盖率门槛；任务状态机、恢复逻辑、命令参数和凭据处理不得存在未测试分支。
+
+## 逻辑重构进度（2026-09-08）
+
+- [x] R1 发布返回明确业务结果；发布失败不得归档，离线测试覆盖 push 失败后保留 PDF、复用原提交重试和归档入口防护。
+- [x] R2 统一任务持久化更新、执行身份与取消确认；测试覆盖并发更新、过期执行、取消确认和等待 Wiki 锁时取消。
+- [x] R3 集中论文发布与仓库协调，站点标题保留独立变更策略；未完成论文发布会阻止标题更新。
+- [x] R4 类型化阶段、阻塞原因和检查点；启动、Retry 与异常恢复共用决策，测试覆盖旧记录迁移、损坏 journal 和归档中断。
+- [x] R5 Worker 只负责调度和编排；分离解析缓存、Agent 运行、部署监控、初始化与设置服务。
+- [x] R6 前端快照、草稿和命令状态分离；主窗口和菜单栏共用展示计算，浏览器 fixtures 与原生命令分离。模块边界及恢复契约见 [架构说明](docs/ARCHITECTURE.md)。
+
+验收重点：中断后可由任务记录与文件/Git 事实决定下一步；任务取消确认前不得重试；远端发布确认前不得归档；Pages 失败不重新分析论文。
+
+本轮验证：62 项 Rust 测试、11 项 Vitest 测试、4 项 Playwright 测试通过；lint、前端 build、Clippy（全部 targets，warnings 视为错误）及 `git diff --check` 通过。另检查桌面、移动和菜单栏截图，无水平溢出或浏览器运行错误。此记录不替代真实外部服务与原生桌面凭据 smoke test。
 
 ## 默认假设
 

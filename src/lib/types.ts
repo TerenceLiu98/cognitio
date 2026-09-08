@@ -17,7 +17,8 @@ export type JobState =
   | "succeeded"
   | "blocked"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "cancelling";
 
 export interface AppSettings {
   schemaVersion: number;
@@ -53,6 +54,22 @@ export interface ToolCapability {
 }
 
 export interface JobSummary {
+  revision: number;
+  stage:
+    | "queued"
+    | "preflight"
+    | "parsing"
+    | "waitingForWiki"
+    | "generating"
+    | "publishing"
+    | "archiving"
+    | "complete";
+  blockReason:
+    | "repositoryDirty"
+    | "publicationInvalid"
+    | "remoteUnavailable"
+    | "legacySettings"
+    | null;
   id: string;
   filename: string;
   state: JobState;
@@ -87,6 +104,7 @@ export interface LogEntry {
 }
 
 export interface AppSnapshot {
+  revision: number;
   ready: boolean;
   configured: boolean;
   watching: boolean;
@@ -126,6 +144,7 @@ export const defaultSettings: AppSettings = {
 };
 
 export const emptySnapshot: AppSnapshot = {
+  revision: 0,
   ready: false,
   configured: false,
   watching: false,

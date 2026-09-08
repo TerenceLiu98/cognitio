@@ -13,12 +13,29 @@
     "macOSPrivateApi": false,
     "windows": [
       {
+        "label": "main",
         "title": "Cognitio",
         "visible": false,
-        "width": 1080,
-        "height": 720,
-        "minWidth": 680,
-        "minHeight": 520
+        "width": 980,
+        "height": 680,
+        "minWidth": 760,
+        "minHeight": 540
+      },
+      {
+        "label": "menubar",
+        "title": "Cognitio",
+        "url": "/?surface=menubar",
+        "visible": false,
+        "width": 390,
+        "height": 560,
+        "minWidth": 390,
+        "minHeight": 500,
+        "maxWidth": 390,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": true
       }
     ],
     "security": {

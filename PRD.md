@@ -11,7 +11,7 @@
 
 Cognitio is a lightweight local menubar utility that continuously converts academic papers into a linked, searchable Markdown knowledge base.
 
-The user drops a PDF into a watched folder. Cognitio detects the file and uses MinerU to convert it to local Markdown before invoking the user's existing coding agent (Codex, Claude Code, or OpenCode) through its official non-interactive CLI interface. The agent activates the Cognitio skill, reads and analyzes the prepared Markdown, searches the existing local knowledge base, creates or updates linked Markdown pages, commits the changes to Git, and pushes them to GitHub.
+The user drops a PDF into a watched folder. Cognitio detects the file and uses MinerU to convert it to local Markdown before invoking the user's existing coding agent (Codex, Claude Code, or OpenCode) through its official non-interactive CLI interface. The agent activates the Cognitio skill, reads and analyzes the prepared Markdown, searches the existing local knowledge base, and creates or updates linked Markdown pages. Cognitio then validates the worktree, creates the task commit, and pushes it to GitHub.
 
 The GitHub repository is the canonical knowledge store. Quartz 5 renders the repository into an interconnected academic knowledge website with wikilinks, backlinks, search, graph navigation, LaTeX, citations, and previews. GitHub Actions builds and deploys the site to GitHub Pages from the same repository.
 
@@ -222,11 +222,11 @@ Cognitio detects stable new file
         ↓
 Cognitio selects configured AgentRunner
         ↓
+Cognitio runs MinerU and verifies the task-local Markdown cache
+        ↓
 Agent starts in local Wiki repository
         ↓
 $llmwiki skill is explicitly invoked
-        ↓
-MinerU converts PDF → Markdown
         ↓
 Agent reads generated Markdown
         ↓
@@ -236,9 +236,9 @@ Agent writes/updates Markdown pages
         ↓
 Agent validates changes
         ↓
-git commit
+Cognitio validates changed paths
         ↓
-git push
+Cognitio creates one task commit and pushes it
         ↓
 GitHub Actions detects the push
         ↓
@@ -625,8 +625,9 @@ The skill should instruct the agent to:
 10. Avoid unsupported claims.
 11. Validate the result.
 12. Inspect `git diff`.
-13. Commit changes.
-14. Push changes.
+13. Return the result to Cognitio without making Git commits or pushing.
+
+Cognitio owns publication validation, the task commit, remote confirmation, and PDF archival. Publication failure preserves the PDF and task commit for retry. GitHub Pages deployment is tracked separately from paper processing.
 
 ---
 
@@ -652,7 +653,7 @@ The app provides a diagnostic CLI:
 llmwiki parse paper.pdf
 ```
 
-The background worker calls the same Rust adapter before starting the Agent and reuses a non-empty task-local `parsed/full.md` on Retry. The Skill must not call MinerU directly. v0.1 does not introduce MinerU MCP or another parsing service.
+The background worker calls the same Rust adapter before starting the Agent and reuses a non-empty task-local `parsed/full.md` on Retry. Up to three jobs may advance concurrently because parsing is isolated under each task directory. Agent execution and Git publication remain serialized behind one Wiki lock. The Skill must not call MinerU directly. v0.1 does not introduce MinerU MCP or another parsing service.
 
 ---
 
@@ -881,13 +882,13 @@ agent writes files
       ↓
 git diff
       ↓
-validation
+Cognitio path and content validation
       ↓
-git add
+Cognitio git add
       ↓
-git commit
+Cognitio git commit
       ↓
-git push
+Cognitio git push
 ```
 
 The menubar app does not need to parse or rewrite the generated knowledge.
@@ -1363,13 +1364,13 @@ Backlinks, graphs, and indexes are derived from Markdown rather than manually ma
        Search existing Wiki
                  │
                  ▼
-        Linked Markdown Wiki
+       Linked Markdown Wiki
                  │
                  ▼
-             git commit
+       App validates changes
                  │
                  ▼
-              git push
+       App commits and pushes
                  │
 ─────────────────┼────────────────
                  ▼

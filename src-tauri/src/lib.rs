@@ -1,14 +1,28 @@
+mod agent_process;
 mod agents;
+mod app_events;
+mod app_state;
+mod archive;
+mod bootstrap;
 mod commands;
 mod config;
 mod credentials;
+mod deployment;
 mod diagnostics;
+mod git;
 mod initialization;
+mod job_runtime;
 mod jobs;
 mod launch_at_login;
 mod logging;
 mod mineru;
 mod models;
+mod parsing;
+mod preflight;
+mod publication;
+mod recovery;
+mod settings;
+mod setup;
 mod skill;
 mod tools;
 mod tray;
@@ -17,10 +31,11 @@ mod wiki;
 mod worker;
 mod workspace;
 
+use app_state::AppState;
 use commands::{
     apply_settings, cancel_initialization, cancel_job, choose_workspace, export_diagnostics,
-    get_app_snapshot, initialize_workspace, open_target, retry_job, run_preflight, set_watching,
-    AppState,
+    get_app_snapshot, hide_menu_panel, initialize_workspace, open_target, retry_job, run_preflight,
+    set_watching, show_app_view,
 };
 use tauri::Manager;
 
@@ -95,12 +110,13 @@ pub fn run() {
         .setup(|app| {
             let state = AppState::new(app.handle())?;
             app.manage(state);
+            app_events::listen(app.handle().clone());
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             tray::install(app)?;
             watcher::start(app.handle().clone());
             worker::start(app.handle().clone());
-            commands::bootstrap(app.handle().clone());
+            bootstrap::start(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -108,6 +124,17 @@ pub fn run() {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window.hide();
+                }
+            } else if window.label() == "menubar" {
+                match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                    tauri::WindowEvent::Focused(false) => {
+                        let _ = window.hide();
+                    }
+                    _ => {}
                 }
             }
         })
@@ -122,6 +149,8 @@ pub fn run() {
             retry_job,
             cancel_job,
             open_target,
+            show_app_view,
+            hide_menu_panel,
             export_diagnostics,
         ])
         .build(tauri::generate_context!())

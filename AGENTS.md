@@ -11,7 +11,7 @@ The Tauri 2 backend lives in `src-tauri/src/`; the SvelteKit/TypeScript UI lives
 Install dependencies with `pnpm install`. The main checks are:
 
 ```sh
-pnpm tauri dev          # run the desktop app in development
+pnpm tauri:dev          # run the isolated desktop development app
 pnpm lint               # run Svelte/TypeScript and formatting checks
 pnpm test               # run Vitest once
 pnpm build              # build the static frontend

@@ -195,7 +195,7 @@
 
 <style>
   .form-section {
-    margin-top: 30px;
+    margin-top: 24px;
   }
   .form-section h2 {
     margin: 0 0 12px;
@@ -206,14 +206,18 @@
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 8px;
+    border-radius: 8px;
+    padding: 10px;
+    background: #f5f6f4;
   }
   .form-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 18px;
-    margin-top: 28px;
-    padding-block: 24px;
-    border-block: 1px solid var(--border);
+    gap: 14px;
+    margin-top: 22px;
+    border-radius: 8px;
+    padding: 14px;
+    background: #f5f6f4;
   }
   label {
     display: grid;
@@ -238,7 +242,7 @@
   }
   .tool-grid {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 8px;
     margin-bottom: 12px;
   }
@@ -249,9 +253,9 @@
     gap: 7px;
     min-height: 44px;
     padding: 8px 10px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--surface);
+    border: 0;
+    border-radius: 8px;
+    background: #f5f6f4;
     font-size: 12px;
   }
   .tool-row strong {
@@ -280,6 +284,7 @@
     color: var(--muted);
     background: #fff7e9;
     font-size: 12px;
+    border-radius: 0 6px 6px 0;
   }
   .report.ready {
     border-color: var(--accent);
@@ -299,6 +304,7 @@
     border-left: 3px solid var(--accent);
     padding: 12px 14px;
     background: var(--surface);
+    border-radius: 0 6px 6px 0;
   }
   .initialization-heading {
     display: flex;
@@ -325,7 +331,7 @@
       transform: rotate(360deg);
     }
   }
-  @media (max-width: 650px) {
+  @media (max-width: 760px) {
     .form-grid,
     .tool-grid {
       grid-template-columns: 1fr;

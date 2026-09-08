@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const VERSION: &str = "4";
+const VERSION: &str = "6";
 const FILES: [(&str, &str); 4] = [
     (
         "SKILL.md",
@@ -148,6 +148,7 @@ mod tests {
         assert!(skill.contains("Do not invoke MinerU"));
         assert!(skill.contains("$LLMWIKI_PARSED_MARKDOWN"));
         assert!(skill.contains("GitHub Actions owns dependency installation and site builds"));
+        assert!(skill.contains("Do not stage, commit, or push"));
     }
 
     #[test]

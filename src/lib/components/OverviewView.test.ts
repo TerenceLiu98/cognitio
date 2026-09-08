@@ -1,14 +1,25 @@
-import { fireEvent, render, screen } from "@testing-library/svelte";
-import { describe, expect, it, vi } from "vitest";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/svelte";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { translate } from "$lib/i18n";
 import { emptySnapshot, type AppSnapshot, type JobSummary } from "$lib/types";
 
 import OverviewView from "./OverviewView.svelte";
 
+afterEach(cleanup);
+
 function job(overrides: Partial<JobSummary>): JobSummary {
   return {
     id: "job-1",
+    revision: 0,
+    stage: "publishing",
+    blockReason: "remoteUnavailable",
     filename: "paper.pdf",
     state: "blocked",
     phase: "Task commit exists but is not pushed",
@@ -40,6 +51,27 @@ function snapshot(jobs: JobSummary[]): AppSnapshot {
 }
 
 describe("OverviewView job actions", () => {
+  it("renders up to three processing jobs together", () => {
+    render(OverviewView, {
+      snapshot: snapshot([
+        job({ id: "one", filename: "one.pdf", state: "running" }),
+        job({ id: "two", filename: "two.pdf", state: "preflight" }),
+        job({ id: "three", filename: "three.pdf", state: "running" }),
+        job({ id: "queued", filename: "queued.pdf", state: "queued" }),
+      ]),
+      t: (key) => translate("en", key),
+      onOpen: vi.fn(),
+      onRetry: vi.fn(),
+      onCancel: vi.fn(),
+    });
+
+    const activity = screen.getByLabelText("Current activity (3)");
+    expect(within(activity).getByText("one.pdf")).toBeInTheDocument();
+    expect(within(activity).getByText("two.pdf")).toBeInTheDocument();
+    expect(within(activity).getByText("three.pdf")).toBeInTheDocument();
+    expect(within(activity).queryByText("queued.pdf")).not.toBeInTheDocument();
+  });
+
   it("renders only actions allowed by the backend", async () => {
     const onRetry = vi.fn();
     render(OverviewView, {

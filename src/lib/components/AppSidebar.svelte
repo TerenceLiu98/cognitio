@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { FileCog, House, Logs, Settings } from "@lucide/svelte";
+  import { BookOpenText, FileCog, House, Logs, Settings } from "@lucide/svelte";
 
   import type { Translator } from "$lib/i18n";
   import type { ViewName } from "$lib/types";
@@ -28,7 +28,7 @@
 
 <aside class="sidebar" aria-label="Primary navigation">
   <div class="brand">
-    <span class="brand-mark">LW</span>
+    <span class="brand-mark"><BookOpenText size={16} /></span>
     <span>{t("appName")}</span>
   </div>
 
@@ -64,47 +64,48 @@
     inset: 0 auto 0 0;
     z-index: 10;
     display: flex;
-    width: 220px;
+    width: 196px;
     flex-direction: column;
-    padding: 24px 16px 18px;
-    color: #f5f5f2;
-    background: #202522;
+    padding: 18px 12px 14px;
+    border-right: 1px solid #d8dad7;
+    color: #242625;
+    background: #e9eae8;
   }
 
   .brand {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 0 8px 24px;
-    font-size: 16px;
-    font-weight: 680;
+    gap: 9px;
+    min-height: 42px;
+    padding: 0 8px 18px;
+    font-size: 14px;
+    font-weight: 650;
   }
 
   .brand-mark {
     display: grid;
-    width: 30px;
-    height: 30px;
+    width: 28px;
+    height: 28px;
     place-items: center;
-    border: 1px solid #626c64;
-    border-radius: 6px;
-    color: #b8d8bd;
-    font-size: 11px;
+    border-radius: 7px;
+    color: #fff;
+    background: #34795a;
   }
 
   nav {
     display: grid;
-    gap: 4px;
+    gap: 3px;
   }
 
   nav button {
     display: flex;
-    min-height: 40px;
+    min-height: 36px;
     align-items: center;
-    gap: 11px;
+    gap: 10px;
     border: 0;
     border-radius: 6px;
     padding: 0 11px;
-    color: #b9bfba;
+    color: #4f5451;
     background: transparent;
     font: inherit;
     text-align: left;
@@ -114,7 +115,12 @@
   nav button:hover,
   nav button.active {
     color: #fff;
-    background: #343b36;
+    background: #0a6fe8;
+  }
+
+  nav button:hover:not(.active) {
+    color: #202322;
+    background: #dcdfdc;
   }
 
   .connection {
@@ -123,8 +129,8 @@
     gap: 9px;
     margin-top: auto;
     padding: 12px 9px 0;
-    border-top: 1px solid #3b413d;
-    color: #aeb4af;
+    border-top: 1px solid #d2d4d1;
+    color: #656a67;
     font-size: 12px;
   }
 
@@ -133,11 +139,11 @@
     height: 8px;
     flex: 0 0 auto;
     border-radius: 50%;
-    background: #7e8780;
+    background: #989d99;
   }
 
   .dot.running {
-    background: #70b879;
+    background: #38a868;
   }
 
   @media (max-width: 720px) {
@@ -147,7 +153,9 @@
       height: 64px;
       flex-direction: row;
       padding: 7px 10px;
-      border-top: 1px solid #3b413d;
+      border-top: 1px solid #d2d4d1;
+      border-right: 0;
+      background: rgba(240, 241, 239, 0.98);
     }
 
     .brand,
@@ -170,6 +178,10 @@
       gap: 2px;
       padding: 0 3px;
       font-size: 10px;
+    }
+
+    nav button:hover:not(.active) {
+      background: #dcdfdc;
     }
   }
 </style>

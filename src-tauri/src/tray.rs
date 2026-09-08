@@ -2,12 +2,12 @@ use std::path::PathBuf;
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
-    tray::TrayIconBuilder,
-    Emitter, Manager, Wry,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Emitter, Manager, PhysicalPosition, Rect, Wry,
 };
 
 use crate::{
-    commands::AppState,
+    app_state::AppState,
     models::{AppSnapshot, Locale},
     wiki,
 };
@@ -100,9 +100,21 @@ pub fn install(app: &tauri::App) -> tauri::Result<()> {
     )?;
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(false)
         .tooltip("Cognitio")
         .icon_as_template(true)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                position,
+                rect,
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_panel(tray.app_handle(), position, rect);
+            }
+        })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "inbox" => open_workspace_path(app, "inbox"),
             "wiki" => open_workspace_path(app, "wiki"),
@@ -129,6 +141,45 @@ pub fn install(app: &tauri::App) -> tauri::Result<()> {
         quit,
     });
     Ok(())
+}
+
+fn toggle_panel(app: &tauri::AppHandle, position: PhysicalPosition<f64>, rect: Rect) {
+    let Some(panel) = app.get_webview_window("menubar") else {
+        return;
+    };
+    if panel.is_visible().unwrap_or(false) {
+        let _ = panel.hide();
+        return;
+    }
+
+    let scale_factor = panel.scale_factor().unwrap_or(1.0);
+    let rect_position = rect.position.to_physical::<i32>(scale_factor);
+    let rect_size = rect.size.to_physical::<u32>(scale_factor);
+    let panel_size = panel.outer_size().unwrap_or_else(|_| (390, 560).into());
+    let mut x = position.x.round() as i32 - panel_size.width as i32 / 2;
+    let mut y = rect_position.y + rect_size.height as i32 + 6;
+
+    if let Ok(monitors) = panel.available_monitors() {
+        if let Some(monitor) = monitors.into_iter().find(|monitor| {
+            let area = monitor.work_area();
+            position.x >= f64::from(area.position.x)
+                && position.x <= f64::from(area.position.x + area.size.width as i32)
+                && position.y >= f64::from(area.position.y)
+                && position.y <= f64::from(area.position.y + area.size.height as i32)
+        }) {
+            let area = monitor.work_area();
+            let left = area.position.x + 8;
+            let right = area.position.x + area.size.width as i32 - panel_size.width as i32 - 8;
+            x = x.clamp(left, right.max(left));
+            if y + panel_size.height as i32 > area.position.y + area.size.height as i32 {
+                y = rect_position.y - panel_size.height as i32 - 6;
+            }
+        }
+    }
+
+    let _ = panel.set_position(PhysicalPosition::new(x, y));
+    let _ = panel.show();
+    let _ = panel.set_focus();
 }
 
 pub fn refresh(app: &tauri::AppHandle, snapshot: &AppSnapshot) {
@@ -247,7 +298,7 @@ fn presentation(snapshot: &AppSnapshot) -> TrayPresentation {
 }
 
 fn toggle_watching(app: &tauri::AppHandle) {
-    let current = {
+    {
         let state = app.state::<AppState>();
         let Ok(mut snapshot) = state.snapshot.lock() else {
             return;
@@ -256,10 +307,8 @@ fn toggle_watching(app: &tauri::AppHandle) {
             return;
         }
         snapshot.watching = !snapshot.watching;
-        snapshot.clone()
-    };
-    let _ = app.emit("app-snapshot", current.clone());
-    refresh(app, &current);
+    }
+    crate::app_events::publish(app);
 }
 
 fn open_workspace_path(app: &tauri::AppHandle, directory: &str) {
@@ -327,6 +376,7 @@ impl AppSnapshot {
     fn empty_for_tray() -> Self {
         Self {
             ready: false,
+            revision: 0,
             configured: false,
             watching: false,
             mineru_token_configured: false,
@@ -358,6 +408,9 @@ mod tests {
             ..AppSettings::default()
         };
         snapshot.jobs.push(JobSummary {
+            revision: 0,
+            stage: crate::jobs::JobStage::Queued,
+            block_reason: None,
             id: "job".into(),
             filename: "paper.pdf".into(),
             state: "running".into(),
@@ -375,6 +428,9 @@ mod tests {
         snapshot.jobs.insert(
             0,
             JobSummary {
+                revision: 0,
+                stage: crate::jobs::JobStage::Generating,
+                block_reason: None,
                 id: "queued".into(),
                 filename: "queued.pdf".into(),
                 state: "queued".into(),

@@ -94,6 +94,9 @@ pub struct ToolCapability {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobSummary {
+    pub revision: u64,
+    pub stage: crate::jobs::JobStage,
+    pub block_reason: Option<crate::jobs::BlockReason>,
     pub id: String,
     pub filename: String,
     pub state: String,
@@ -142,6 +145,7 @@ pub struct LogEntry {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSnapshot {
+    pub revision: u64,
     pub ready: bool,
     pub configured: bool,
     pub watching: bool,

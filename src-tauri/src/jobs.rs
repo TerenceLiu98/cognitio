@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use chrono::Utc;
@@ -26,6 +27,7 @@ pub enum JobState {
     Blocked,
     Failed,
     Cancelled,
+    Cancelling,
 }
 
 impl JobState {
@@ -42,6 +44,7 @@ impl JobState {
             Self::Blocked => "blocked",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Cancelling => "cancelling",
         }
     }
 
@@ -55,15 +58,27 @@ impl JobState {
                 )
                 | (
                     Self::Queued,
-                    Self::Preflight | Self::Failed | Self::Cancelled
+                    Self::Preflight | Self::Failed | Self::Cancelled | Self::Cancelling
                 )
                 | (
                     Self::Preflight,
-                    Self::Running | Self::Blocked | Self::Failed | Self::Cancelled
+                    Self::Running
+                        | Self::Blocked
+                        | Self::Failed
+                        | Self::Cancelled
+                        | Self::Cancelling
                 )
                 | (
                     Self::Running,
-                    Self::Verifying | Self::Failed | Self::Cancelled
+                    Self::Verifying
+                        | Self::Blocked
+                        | Self::Failed
+                        | Self::Cancelled
+                        | Self::Cancelling
+                )
+                | (
+                    Self::Cancelling,
+                    Self::Cancelled | Self::Blocked | Self::Failed
                 )
                 | (
                     Self::Verifying,
@@ -88,7 +103,7 @@ impl JobState {
             Self::Blocked | Self::Failed | Self::Cancelled => {
                 vec!["retry".into(), "reparse".into()]
             }
-            Self::Verifying | Self::Archiving | Self::Succeeded => Vec::new(),
+            Self::Verifying | Self::Archiving | Self::Succeeded | Self::Cancelling => Vec::new(),
         }
     }
 }
@@ -147,8 +162,8 @@ pub struct JobRecord {
     pub error: Option<String>,
     #[serde(default)]
     pub base_commit: Option<String>,
-    #[serde(default)]
-    pub published_commit: Option<String>,
+    #[serde(default, alias = "publishedCommit")]
+    pub task_commit: Option<String>,
     #[serde(default)]
     pub execution: Option<ExecutionSettings>,
     #[serde(default)]
@@ -159,6 +174,144 @@ pub struct JobRecord {
     pub archive_destination: Option<PathBuf>,
     #[serde(default)]
     pub deployment: DeploymentSummary,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub active_run: Option<String>,
+    #[serde(default)]
+    pub stage: JobStage,
+    #[serde(default)]
+    pub block_reason: Option<BlockReason>,
+    #[serde(default)]
+    pub remote_confirmed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JobStage {
+    #[default]
+    Queued,
+    Preflight,
+    Parsing,
+    WaitingForWiki,
+    Generating,
+    Publishing,
+    Archiving,
+    Complete,
+}
+
+impl JobStage {
+    pub fn presentation(self) -> (JobState, &'static str, u8) {
+        match self {
+            Self::Queued => (JobState::Queued, "Waiting for processor", 10),
+            Self::Preflight => (JobState::Preflight, "Checking parser and agent", 15),
+            Self::Parsing => (JobState::Running, "Parsing PDF with MinerU", 25),
+            Self::WaitingForWiki => (JobState::Running, "Waiting for Wiki publication", 45),
+            Self::Generating => (JobState::Running, "Generating linked knowledge pages", 55),
+            Self::Publishing => (JobState::Verifying, "Verifying Git publication", 85),
+            Self::Archiving => (JobState::Archiving, "Archiving source PDF", 95),
+            Self::Complete => (JobState::Succeeded, "Published", 100),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlockReason {
+    RepositoryDirty,
+    PublicationInvalid,
+    RemoteUnavailable,
+    LegacySettings,
+}
+
+#[derive(Clone, Debug)]
+pub enum JobEvent {
+    Advance(JobStage),
+    ExecutionMetadata {
+        agent: String,
+        base_commit: String,
+    },
+    ParseReady,
+    TaskCommit(String),
+    PublicationConfirmed(String),
+    ArchivePlanned(Option<PathBuf>),
+    Archived,
+    Blocked {
+        reason: BlockReason,
+        scope: BlockScope,
+        message: String,
+    },
+    Failed(String),
+}
+
+pub fn apply_event(
+    workspace: &Path,
+    expected: &JobRecord,
+    event: JobEvent,
+) -> Result<JobRecord, String> {
+    mutate(workspace, &expected.id, |record| {
+        if record.active_run != expected.active_run {
+            return Err("execution no longer owns this job".into());
+        }
+        match event {
+            JobEvent::Advance(stage) => {
+                if record.state == JobState::Cancelling {
+                    return Err("execution is being cancelled".into());
+                }
+                let (state, phase, progress) = stage.presentation();
+                if state != record.state {
+                    record.transition(state, phase, progress)?;
+                }
+                record.stage = stage;
+                record.phase = phase.into();
+                record.progress = progress;
+            }
+            JobEvent::ExecutionMetadata { agent, base_commit } => {
+                record.agent = Some(agent);
+                record.base_commit = Some(base_commit);
+            }
+            JobEvent::ParseReady => record.force_reparse = false,
+            JobEvent::TaskCommit(commit) => record.task_commit = Some(commit),
+            JobEvent::PublicationConfirmed(commit) => {
+                if record.task_commit.as_deref() != Some(&commit) {
+                    return Err("remote confirmation does not match the task commit".into());
+                }
+                record.remote_confirmed = true;
+                record.transition(JobState::Archiving, "Archiving source PDF", 95)?;
+                record.stage = JobStage::Archiving;
+            }
+            JobEvent::ArchivePlanned(destination) => {
+                if record.state != JobState::Archiving || !record.remote_confirmed {
+                    return Err("source archival requires a confirmed publication".into());
+                }
+                record.archive_destination = destination;
+            }
+            JobEvent::Archived => {
+                record.transition(JobState::Succeeded, "Published", 100)?;
+                record.stage = JobStage::Complete;
+                record.deployment = DeploymentSummary {
+                    status: "pending".into(),
+                    updated_at: Some(Utc::now().to_rfc3339()),
+                    ..DeploymentSummary::default()
+                };
+            }
+            JobEvent::Blocked {
+                reason,
+                scope,
+                message,
+            } => {
+                record.transition(JobState::Blocked, &message, record.progress)?;
+                record.error = Some(message);
+                record.block_reason = Some(reason);
+                record.block_scope = Some(scope);
+            }
+            JobEvent::Failed(message) => {
+                record.transition(JobState::Failed, "Failed", record.progress)?;
+                record.error = Some(message);
+            }
+        }
+        Ok(())
+    })
 }
 
 impl JobRecord {
@@ -182,8 +335,11 @@ impl JobRecord {
             self.agent = None;
             self.error = None;
             self.base_commit = None;
-            self.published_commit = None;
+            self.task_commit = None;
             self.block_scope = None;
+            self.block_reason = None;
+            self.remote_confirmed = false;
+            self.stage = JobStage::Queued;
             self.archive_destination = None;
             self.deployment = DeploymentSummary::default();
         }
@@ -195,11 +351,16 @@ impl JobRecord {
 impl From<&JobRecord> for JobSummary {
     fn from(record: &JobRecord) -> Self {
         let mut allowed_actions = record.state.allowed_actions();
-        if record.published_commit.is_some() {
+        if record.active_run.is_some() {
+            allowed_actions.retain(|action| action == "cancel");
+        }
+        if record.task_commit.is_some() {
             allowed_actions.retain(|action| action != "reparse");
         }
         Self {
             id: record.id.clone(),
+            stage: record.stage,
+            block_reason: record.block_reason,
             filename: record.filename.clone(),
             state: record.state.as_str().into(),
             phase: record.phase.clone(),
@@ -218,6 +379,7 @@ impl From<&JobRecord> for JobSummary {
                     MineruMode::Flash => "flash".into(),
                 }),
             deployment: record.deployment.clone(),
+            revision: record.revision,
         }
     }
 }
@@ -238,13 +400,14 @@ pub fn create(
     fs::copy(source, &input_path)
         .map_err(|error| format!("copy PDF into job directory: {error}"))?;
     let now = Utc::now().to_rfc3339();
+    let captured_hash = sha256(&input_path)?;
     let record = JobRecord {
-        schema_version: 2,
+        schema_version: 3,
         id,
         filename: filename.into(),
         source_path: source.to_path_buf(),
         input_path,
-        sha256: sha256(source)?,
+        sha256: captured_hash,
         state: JobState::Queued,
         phase: "Waiting for processor".into(),
         progress: 10,
@@ -253,12 +416,17 @@ pub fn create(
         updated_at: now,
         error: None,
         base_commit: None,
-        published_commit: None,
+        task_commit: None,
         execution: Some(settings.into()),
         force_reparse: false,
         block_scope: None,
         archive_destination: None,
         deployment: DeploymentSummary::default(),
+        revision: 0,
+        active_run: None,
+        stage: JobStage::Queued,
+        block_reason: None,
+        remote_confirmed: false,
     };
     save(workspace, &record)?;
     Ok(record)
@@ -281,7 +449,16 @@ pub fn sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+static STORE_WRITE: Mutex<()> = Mutex::new(());
+
 pub fn save(workspace: &Path, record: &JobRecord) -> Result<(), String> {
+    let _guard = STORE_WRITE
+        .lock()
+        .map_err(|_| "job store lock is poisoned".to_string())?;
+    save_unlocked(workspace, record)
+}
+
+fn save_unlocked(workspace: &Path, record: &JobRecord) -> Result<(), String> {
     let directory = workspace.join("processing").join(&record.id);
     fs::create_dir_all(&directory).map_err(|error| format!("create job directory: {error}"))?;
     let path = directory.join("job.json");
@@ -297,178 +474,83 @@ pub fn save(workspace: &Path, record: &JobRecord) -> Result<(), String> {
     fs::rename(temporary, path).map_err(|error| format!("replace job: {error}"))
 }
 
-pub fn load_all(workspace: &Path) -> Vec<JobRecord> {
-    let Ok(entries) = fs::read_dir(workspace.join("processing")) else {
-        return Vec::new();
-    };
-    let mut records: Vec<_> = entries
-        .flatten()
-        .filter_map(|entry| fs::read_to_string(entry.path().join("job.json")).ok())
-        .filter_map(|json| serde_json::from_str(&json).ok())
-        .collect();
+pub fn load_all(workspace: &Path) -> Result<Vec<JobRecord>, String> {
+    let directory = workspace.join("processing");
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let entries =
+        fs::read_dir(&directory).map_err(|error| format!("read task directory: {error}"))?;
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read task entry: {error}"))?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let id = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "task directory name is not UTF-8".to_string())?;
+        records.push(load(workspace, &id).map_err(|error| format!("task {id}: {error}"))?);
+    }
     records.sort_by(|left: &JobRecord, right: &JobRecord| right.updated_at.cmp(&left.updated_at));
-    records
+    Ok(records)
 }
 
 pub fn load(workspace: &Path, id: &str) -> Result<JobRecord, String> {
+    if !matches!(
+        Path::new(id).components().collect::<Vec<_>>().as_slice(),
+        [std::path::Component::Normal(_)]
+    ) {
+        return Err("invalid task id".into());
+    }
     let path = workspace.join("processing").join(id).join("job.json");
     let json = fs::read_to_string(path).map_err(|error| format!("read job: {error}"))?;
-    serde_json::from_str(&json).map_err(|error| format!("parse job: {error}"))
-}
-
-pub fn recover(workspace: &Path) -> Vec<JobRecord> {
-    let wiki = workspace.join("wiki");
-    let wiki_clean =
-        git_value(&wiki, &["status", "--porcelain"]).is_some_and(|value| value.is_empty());
-    let mut records = load_all(workspace);
-    for record in &mut records {
-        record.schema_version = 2;
-        if record.execution.is_none()
-            && !matches!(
-                record.state,
-                JobState::Succeeded | JobState::Failed | JobState::Cancelled
-            )
-        {
-            record.state = JobState::Blocked;
-            record.phase = "Legacy job requires retry".into();
-            record.error = Some("Retry this job to capture the current processing settings".into());
-            record.block_scope = Some(BlockScope::Job);
-            record.updated_at = Utc::now().to_rfc3339();
-            let _ = save(workspace, record);
-            continue;
-        }
-        if matches!(
-            record.state,
-            JobState::Succeeded | JobState::Failed | JobState::Cancelled
-        ) {
-            let _ = save(workspace, record);
-            continue;
-        }
-        if !wiki_clean {
-            record.state = JobState::Blocked;
-            record.phase = "Wiki has uncommitted changes".into();
-            record.error = Some("Clean or commit the Wiki worktree before retrying".into());
-            record.block_scope = Some(BlockScope::Repository);
-            record.updated_at = Utc::now().to_rfc3339();
-            let _ = save(workspace, record);
-            continue;
-        }
-
-        let matching = match find_job_commit(&wiki, record) {
-            Ok(value) => value,
-            Err(error) => {
-                record.state = JobState::Blocked;
-                record.phase = "Git publication requires review".into();
-                record.error = Some(error);
-                record.block_scope = Some(BlockScope::Repository);
-                record.updated_at = Utc::now().to_rfc3339();
-                let _ = save(workspace, record);
-                continue;
-            }
+    let mut record: JobRecord =
+        serde_json::from_str(&json).map_err(|error| format!("parse job: {error}"))?;
+    if record.id != id {
+        return Err("task id does not match its directory".into());
+    }
+    if !(1..=3).contains(&record.schema_version) {
+        return Err("unsupported job schema version".into());
+    }
+    if record.schema_version < 3 {
+        record.stage = match record.state {
+            JobState::Preflight => JobStage::Preflight,
+            JobState::Running if record.base_commit.is_some() => JobStage::Generating,
+            JobState::Running => JobStage::Parsing,
+            JobState::Verifying => JobStage::Publishing,
+            JobState::Archiving => JobStage::Archiving,
+            JobState::Succeeded => JobStage::Complete,
+            _ => JobStage::Queued,
         };
-        if let Some(commit) = matching {
-            let published = commit_on_upstream(&wiki, &commit);
-            record.published_commit = Some(commit);
-            record.state = if published {
-                JobState::Archiving
-            } else {
-                JobState::Blocked
-            };
-            record.phase = if published {
-                "Resuming source archival"
-            } else {
-                "Task commit exists but is not pushed"
+        // Interpret legacy prose only at the migration boundary.
+        record.block_reason = match (record.block_scope, record.phase.as_str()) {
+            (
+                Some(BlockScope::Repository),
+                "Wiki has uncommitted changes" | "Agent stopped with uncommitted Wiki changes",
+            ) => Some(BlockReason::RepositoryDirty),
+            (Some(BlockScope::Repository), _) => Some(BlockReason::PublicationInvalid),
+            (Some(BlockScope::Job), _) if record.task_commit.is_some() => {
+                Some(BlockReason::RemoteUnavailable)
             }
-            .into();
-            record.error = (!published).then(|| "Retry to resume Git push".into());
-            record.block_scope = (!published).then_some(BlockScope::Job);
-            record.updated_at = Utc::now().to_rfc3339();
-            let _ = save(workspace, record);
-            continue;
-        }
-
-        match record.state {
-            JobState::Detected | JobState::Stabilizing => {
-                record.state = JobState::Queued;
-                record.phase = "Recovered after restart".into();
-                record.updated_at = Utc::now().to_rfc3339();
-                let _ = save(workspace, record);
-            }
-            JobState::Preflight | JobState::Running | JobState::Verifying => {
-                record.state = JobState::Queued;
-                record.phase = "Recovered after restart".into();
-                record.base_commit = None;
-                record.agent = None;
-                record.updated_at = Utc::now().to_rfc3339();
-                let _ = save(workspace, record);
-            }
-            _ => {}
-        }
+            _ => None,
+        };
+        record.schema_version = 3;
     }
-    records
+    Ok(record)
 }
 
-pub fn find_job_commit(wiki: &Path, record: &JobRecord) -> Result<Option<String>, String> {
-    let Some(base) = record.base_commit.as_deref() else {
-        return Ok(record.published_commit.clone());
-    };
-    let commits = git_value(wiki, &["log", "--format=%H", &format!("{base}..HEAD")])
-        .ok_or_else(|| "read commits created after job baseline".to_string())?;
-    let trailer = format!("Cognitio-Job: {}", record.id);
-    let mut matching = Vec::new();
-    for commit in commits.lines().filter(|line| !line.trim().is_empty()) {
-        let body = git_value(wiki, &["show", "-s", "--format=%B", commit])
-            .ok_or_else(|| format!("read task commit {commit}"))?;
-        if body.lines().any(|line| line.trim() == trailer) {
-            matching.push(commit.to_owned());
-        }
-    }
-    match matching.as_slice() {
-        [] => Ok(None),
-        [commit] => Ok(Some(commit.clone())),
-        _ => Err("multiple commits claim the same Cognitio job id".into()),
-    }
-}
-
-pub fn commit_on_upstream(wiki: &Path, commit: &str) -> bool {
-    std::process::Command::new("git")
-        .args(["merge-base", "--is-ancestor", commit, "@{u}"])
-        .current_dir(wiki)
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
+#[cfg(test)]
 pub fn set_execution(
     workspace: &Path,
     id: &str,
     agent: &str,
     base_commit: &str,
 ) -> Result<JobRecord, String> {
-    let path = workspace.join("processing").join(id).join("job.json");
-    let json = fs::read_to_string(path).map_err(|error| format!("read job: {error}"))?;
-    let mut record: JobRecord =
-        serde_json::from_str(&json).map_err(|error| format!("parse job: {error}"))?;
-    record.agent = Some(agent.into());
-    record.base_commit = Some(base_commit.into());
-    record.updated_at = Utc::now().to_rfc3339();
-    save(workspace, &record)?;
-    Ok(record)
-}
-
-pub fn set_published_commit(workspace: &Path, id: &str, commit: &str) -> Result<JobRecord, String> {
     mutate(workspace, id, |record| {
-        record.published_commit = Some(commit.into());
-        Ok(())
-    })
-}
-
-pub fn set_archive_destination(
-    workspace: &Path,
-    id: &str,
-    destination: Option<PathBuf>,
-) -> Result<JobRecord, String> {
-    mutate(workspace, id, |record| {
-        record.archive_destination = destination;
+        record.agent = Some(agent.into());
+        record.base_commit = Some(base_commit.into());
         Ok(())
     })
 }
@@ -484,13 +566,7 @@ pub fn set_deployment(
     })
 }
 
-pub fn clear_force_reparse(workspace: &Path, id: &str) -> Result<JobRecord, String> {
-    mutate(workspace, id, |record| {
-        record.force_reparse = false;
-        Ok(())
-    })
-}
-
+#[cfg(test)]
 pub fn block(
     workspace: &Path,
     id: &str,
@@ -505,6 +581,7 @@ pub fn block(
     })
 }
 
+#[cfg(test)]
 pub fn retry(
     workspace: &Path,
     id: &str,
@@ -512,13 +589,16 @@ pub fn retry(
     force_reparse: bool,
 ) -> Result<JobRecord, String> {
     mutate(workspace, id, |record| {
+        if record.active_run.is_some() {
+            return Err("wait for the current execution to stop before retrying".into());
+        }
         if !matches!(
             record.state,
             JobState::Blocked | JobState::Failed | JobState::Cancelled
         ) {
             return Err(format!("{} cannot be retried", record.state.as_str()));
         }
-        if force_reparse && record.published_commit.is_some() {
+        if force_reparse && record.task_commit.is_some() {
             return Err("a published task can only resume verification or archival".into());
         }
         if record.execution.is_none() {
@@ -530,7 +610,7 @@ pub fn retry(
             }
         }
         record.force_reparse = force_reparse;
-        let next = if record.published_commit.is_some() {
+        let next = if record.task_commit.is_some() {
             JobState::Verifying
         } else {
             JobState::Queued
@@ -539,18 +619,7 @@ pub fn retry(
     })
 }
 
-fn git_value(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().into())
-}
-
+#[cfg(test)]
 pub fn update(
     workspace: &Path,
     id: &str,
@@ -558,13 +627,9 @@ pub fn update(
     phase: &str,
     progress: u8,
 ) -> Result<JobRecord, String> {
-    let path = workspace.join("processing").join(id).join("job.json");
-    let json = fs::read_to_string(path).map_err(|error| format!("read job: {error}"))?;
-    let mut record: JobRecord =
-        serde_json::from_str(&json).map_err(|error| format!("parse job: {error}"))?;
-    record.transition(next, phase, progress)?;
-    save(workspace, &record)?;
-    Ok(record)
+    mutate(workspace, id, |record| {
+        record.transition(next, phase, progress)
+    })
 }
 
 fn mutate(
@@ -572,48 +637,212 @@ fn mutate(
     id: &str,
     update: impl FnOnce(&mut JobRecord) -> Result<(), String>,
 ) -> Result<JobRecord, String> {
-    let path = workspace.join("processing").join(id).join("job.json");
-    let json = fs::read_to_string(path).map_err(|error| format!("read job: {error}"))?;
-    let mut record: JobRecord =
-        serde_json::from_str(&json).map_err(|error| format!("parse job: {error}"))?;
+    let _guard = STORE_WRITE
+        .lock()
+        .map_err(|_| "job store lock is poisoned".to_string())?;
+    let mut record = load(workspace, id)?;
     update(&mut record)?;
+    record.revision += 1;
     record.updated_at = Utc::now().to_rfc3339();
-    save(workspace, &record)?;
+    save_unlocked(workspace, &record)?;
     Ok(record)
 }
 
-pub fn update_phase(
+pub fn apply_recovery(
     workspace: &Path,
-    id: &str,
-    phase: &str,
-    progress: u8,
+    expected: &JobRecord,
+    decision: crate::recovery::Decision,
+    restart: bool,
 ) -> Result<JobRecord, String> {
-    let path = workspace.join("processing").join(id).join("job.json");
-    let json = fs::read_to_string(path).map_err(|error| format!("read job: {error}"))?;
-    let mut record: JobRecord =
-        serde_json::from_str(&json).map_err(|error| format!("parse job: {error}"))?;
-    record.phase = phase.into();
-    record.progress = progress.min(100);
-    record.updated_at = Utc::now().to_rfc3339();
-    save(workspace, &record)?;
-    Ok(record)
+    mutate(workspace, &expected.id, |record| {
+        if record.revision != expected.revision || record.active_run != expected.active_run {
+            return Err("job changed while recovery was inspecting it".into());
+        }
+        crate::recovery::apply(record, decision);
+        if restart {
+            record.active_run = None;
+        }
+        Ok(())
+    })
+}
+
+pub fn apply_retry(
+    workspace: &Path,
+    expected: &JobRecord,
+    settings: &AppSettings,
+    force_reparse: bool,
+    decision: crate::recovery::Decision,
+) -> Result<JobRecord, String> {
+    mutate(workspace, &expected.id, |record| {
+        if record.active_run.is_some() || record.revision != expected.revision {
+            return Err("job changed or still has an active execution".into());
+        }
+        if !matches!(
+            record.state,
+            JobState::Blocked | JobState::Failed | JobState::Cancelled
+        ) {
+            return Err("this job cannot be retried".into());
+        }
+        if force_reparse
+            && (record.task_commit.is_some()
+                || matches!(
+                    &decision,
+                    crate::recovery::Decision::Verify(_)
+                        | crate::recovery::Decision::Archive(_)
+                        | crate::recovery::Decision::Block {
+                            commit: Some(_),
+                            ..
+                        }
+                ))
+        {
+            return Err(
+                "a task commit already exists; resume publication instead of reparsing".into(),
+            );
+        }
+        if record.execution.is_none() {
+            record.execution = Some(settings.into());
+        }
+        if force_reparse {
+            if let Some(execution) = &mut record.execution {
+                execution.mineru_mode = settings.mineru_mode.clone();
+            }
+        }
+        record.force_reparse = force_reparse;
+        crate::recovery::apply(record, decision);
+        Ok(())
+    })
 }
 
 pub fn fail(workspace: &Path, id: &str, error: &str) -> Result<JobRecord, String> {
-    let path = workspace.join("processing").join(id).join("job.json");
-    let json = fs::read_to_string(path).map_err(|read_error| format!("read job: {read_error}"))?;
-    let mut record: JobRecord =
-        serde_json::from_str(&json).map_err(|parse_error| format!("parse job: {parse_error}"))?;
-    record.transition(JobState::Failed, "Failed", record.progress)?;
-    record.error = Some(error.into());
-    save(workspace, &record)?;
-    Ok(record)
+    mutate(workspace, id, |record| {
+        record.transition(JobState::Failed, "Failed", record.progress)?;
+        record.error = Some(error.into());
+        Ok(())
+    })
+}
+
+pub fn claim(workspace: &Path, id: &str, run_id: &str) -> Result<JobRecord, String> {
+    mutate(workspace, id, |record| {
+        if record.active_run.is_some()
+            || !matches!(
+                record.state,
+                JobState::Queued | JobState::Verifying | JobState::Archiving
+            )
+        {
+            return Err("job is not available for execution".into());
+        }
+        record.active_run = Some(run_id.into());
+        Ok(())
+    })
+}
+
+pub fn request_cancel(workspace: &Path, id: &str) -> Result<JobRecord, String> {
+    mutate(workspace, id, |record| {
+        if !record
+            .state
+            .allowed_actions()
+            .iter()
+            .any(|action| action == "cancel")
+        {
+            return Err("this job cannot be cancelled at its current stage".into());
+        }
+        let next = if record.active_run.is_some() {
+            JobState::Cancelling
+        } else {
+            JobState::Cancelled
+        };
+        record.transition(
+            next,
+            if next == JobState::Cancelling {
+                "Stopping current execution"
+            } else {
+                "Cancelled"
+            },
+            record.progress,
+        )
+    })
+}
+
+pub fn finish_execution(
+    workspace: &Path,
+    id: &str,
+    run_id: &str,
+    error: Option<&str>,
+) -> Result<JobRecord, String> {
+    mutate(workspace, id, |record| {
+        if record.active_run.as_deref() != Some(run_id) {
+            return Err("execution no longer owns this job".into());
+        }
+        if record.state == JobState::Cancelling {
+            record.transition(JobState::Cancelled, "Cancelled", record.progress)?;
+        } else if !matches!(
+            record.state,
+            JobState::Succeeded | JobState::Blocked | JobState::Failed | JobState::Cancelled
+        ) {
+            record.transition(JobState::Failed, "Execution stopped", record.progress)?;
+            record.error = Some(
+                error
+                    .unwrap_or("execution ended before reaching a terminal state")
+                    .into(),
+            );
+        }
+        record.active_run = None;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn legacy_records_migrate_once_and_invalid_journals_are_reported() {
+        let root =
+            std::env::temp_dir().join(format!("cognitio-job-migration-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("inbox")).unwrap();
+        let source = root.join("inbox/paper.pdf");
+        fs::write(&source, b"%PDF-1.4\n").unwrap();
+        let record = create(&root, &source, &AppSettings::default()).unwrap();
+        let path = root.join("processing").join(&record.id).join("job.json");
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        let fields = legacy.as_object_mut().unwrap();
+        fields.insert("schemaVersion".into(), 2.into());
+        fields.insert("state".into(), "blocked".into());
+        fields.insert("blockScope".into(), "job".into());
+        fields.insert("publishedCommit".into(), "task-sha".into());
+        for key in [
+            "taskCommit",
+            "stage",
+            "blockReason",
+            "revision",
+            "activeRun",
+            "remoteConfirmed",
+        ] {
+            fields.remove(key);
+        }
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut migrated = load(&root, &record.id).unwrap();
+        assert_eq!(migrated.schema_version, 3);
+        assert_eq!(migrated.task_commit.as_deref(), Some("task-sha"));
+        assert_eq!(migrated.block_reason, Some(BlockReason::RemoteUnavailable));
+        assert!(!migrated.remote_confirmed);
+        migrated.phase = "Different display text".into();
+        save(&root, &migrated).unwrap();
+        assert_eq!(
+            load(&root, &record.id).unwrap().block_reason,
+            migrated.block_reason
+        );
+        assert!(load(&root, "../outside").is_err());
+        migrated.schema_version = 99;
+        save(&root, &migrated).unwrap();
+        assert!(load_all(&root)
+            .unwrap_err()
+            .contains("unsupported job schema"));
+        fs::write(&path, b"{broken").unwrap();
+        assert!(load_all(&root).unwrap_err().contains(&record.id));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn state_machine_rejects_skipped_phases_and_allows_retry() {
@@ -629,7 +858,61 @@ mod tests {
     }
 
     #[test]
-    fn publication_lookup_requires_the_exact_job_trailer() {
+    fn running_job_persists_repository_block_and_can_retry() {
+        let root = std::env::temp_dir().join(format!(
+            "cognitio-running-block-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let settings = AppSettings::default();
+        for (index, (message, base_commit)) in [
+            ("Wiki has uncommitted changes", None),
+            (
+                "Agent stopped with uncommitted Wiki changes",
+                Some("abc123"),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let workspace = root.join(index.to_string());
+            fs::create_dir_all(workspace.join("inbox")).expect("inbox");
+            let source = workspace.join("inbox/paper.pdf");
+            fs::write(&source, b"%PDF-1.4\n").expect("PDF");
+            let record = create(&workspace, &source, &settings).expect("job");
+            update(&workspace, &record.id, JobState::Preflight, "Preflight", 15)
+                .expect("preflight");
+            update(&workspace, &record.id, JobState::Running, "Running", 25).expect("running");
+            if let Some(base) = base_commit {
+                set_execution(&workspace, &record.id, "codex", base).expect("execution metadata");
+            }
+
+            block(&workspace, &record.id, message, BlockScope::Repository)
+                .expect("block running job");
+
+            let blocked = load(&workspace, &record.id).expect("reload blocked job");
+            assert_eq!(blocked.state, JobState::Blocked);
+            assert_eq!(blocked.phase, message);
+            assert_eq!(blocked.error.as_deref(), Some(message));
+            assert_eq!(blocked.block_scope, Some(BlockScope::Repository));
+            assert_eq!(blocked.base_commit.as_deref(), base_commit);
+            assert_eq!(
+                JobSummary::from(&blocked).allowed_actions,
+                ["retry", "reparse"]
+            );
+
+            retry(&workspace, &record.id, &settings, false).expect("retry blocked job");
+            let retried = load(&workspace, &record.id).expect("reload retried job");
+            assert_eq!(retried.state, JobState::Queued);
+            assert_eq!(retried.error, None);
+            assert_eq!(retried.block_scope, None);
+            assert_eq!(retried.base_commit, None);
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn publication_lookup_requires_the_exact_job_trailer() {
         let root = std::env::temp_dir().join(format!(
             "cognitio-trailer-{}-{}",
             std::process::id(),
@@ -650,18 +933,41 @@ mod tests {
         let source = workspace.join("inbox/paper.pdf");
         fs::write(&source, b"%PDF-1.4\n").expect("PDF");
         let mut record = create(&workspace, &source, &AppSettings::default()).expect("job");
-        record.base_commit = Some(base);
+        record.base_commit = Some(base.clone());
 
         fs::write(wiki.join("content/papers/unrelated.md"), "unrelated\n").expect("unrelated file");
         git(&wiki, &["add", "."]);
         git(&wiki, &["commit", "-m", "Unrelated commit"]);
-        assert_eq!(find_job_commit(&wiki, &record).expect("lookup"), None);
+        assert_eq!(
+            crate::publication::find_task_commit(&wiki, &record)
+                .await
+                .expect("lookup"),
+            None
+        );
 
         fs::write(wiki.join("content/papers/paper.md"), "paper\n").expect("paper file");
         git(&wiki, &["add", "."]);
         let trailer = format!("Cognitio-Job: {}", record.id);
         git(&wiki, &["commit", "-m", "Add paper", "-m", &trailer]);
-        assert!(find_job_commit(&wiki, &record).expect("lookup").is_some());
+        let task_commit = crate::publication::find_task_commit(&wiki, &record)
+            .await
+            .expect("lookup")
+            .expect("task commit");
+
+        record.base_commit = None;
+        assert!(crate::publication::find_task_commit(&wiki, &record)
+            .await
+            .expect("history lookup")
+            .is_some());
+        record.task_commit = Some(task_commit);
+        assert!(crate::publication::find_task_commit(&wiki, &record)
+            .await
+            .expect("recorded publication lookup")
+            .is_some());
+        record.task_commit = Some(base);
+        assert!(crate::publication::find_task_commit(&wiki, &record)
+            .await
+            .is_err());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -682,12 +988,17 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             error: Some("stale error".into()),
             base_commit: Some("abc123".into()),
-            published_commit: None,
+            task_commit: None,
             execution: Some((&AppSettings::default()).into()),
             force_reparse: false,
             block_scope: Some(BlockScope::Job),
             archive_destination: None,
             deployment: DeploymentSummary::default(),
+            revision: 0,
+            active_run: None,
+            stage: crate::jobs::JobStage::Queued,
+            block_reason: None,
+            remote_confirmed: false,
         };
 
         record
@@ -699,8 +1010,8 @@ mod tests {
         assert_eq!(record.base_commit, None);
     }
 
-    #[test]
-    fn published_interrupted_job_resumes_at_archiving() {
+    #[tokio::test]
+    async fn published_interrupted_job_resumes_at_archiving() {
         let root = std::env::temp_dir().join(format!(
             "llmwiki-recovery-{}-{}",
             std::process::id(),
@@ -739,13 +1050,13 @@ mod tests {
         git(&wiki, &["commit", "-m", "Publish paper", "-m", &trailer]);
         git(&wiki, &["push"]);
 
-        let recovered = recover(&workspace);
+        let recovered = crate::recovery::recover_all(&workspace).await.unwrap();
         let job = recovered
             .iter()
             .find(|candidate| candidate.id == record.id)
             .expect("recovered job");
         assert_eq!(job.state, JobState::Archiving);
-        assert_eq!(job.phase, "Resuming source archival");
+        assert!(job.remote_confirmed);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
